@@ -6,6 +6,8 @@
   integration regression against `get_FF_beads.ipynb` outputs.
 - Make the TX9 integration regression CI-ready with a self-contained,
   12-frame stratified trajectory fixture and GitHub Actions coverage.
+- Prepare the README for public use and license the project under LGPL v3.0 or
+  later.
 
 ## 0.1.0 — 2026-08-20
 

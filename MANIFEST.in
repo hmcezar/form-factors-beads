@@ -1,4 +1,4 @@
-include README.md CHANGELOG.md
+include README.md CHANGELOG.md LICENSE
 recursive-include examples *.yaml
 recursive-include tests *.py *.csv *.yaml *.pdb *.map *.xtc
 recursive-include src/form_factors_beads/data *.yaml
