@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+results/
+form_factor_output/
+*.xtc
+*.trr
+*.dcd
+*.nc

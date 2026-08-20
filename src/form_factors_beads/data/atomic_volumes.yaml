@@ -1,0 +1,28 @@
+# Solvent-displaced atomic volumes used by the Fraser SAXS correction.
+# These are not van der Waals volumes.  Keep provenance with every value and
+# add unsupported elements through the run configuration instead of guessing.
+volumes_A3:
+  H:
+    value: 5.15
+    source: "Fraser, MacRae & Suzuki, J. Appl. Cryst. 11 (1978) 693-694, Table 1"
+    convention: observed_solvent_displaced_volume
+  D:
+    value: 5.15
+    source: "Hydrogen isotope uses the H displaced volume"
+    convention: observed_solvent_displaced_volume
+  C:
+    value: 16.44
+    source: "Fraser, MacRae & Suzuki, J. Appl. Cryst. 11 (1978) 693-694, Table 1"
+    convention: observed_solvent_displaced_volume
+  N:
+    value: 2.49
+    source: "Fraser, MacRae & Suzuki, J. Appl. Cryst. 11 (1978) 693-694, Table 1"
+    convention: observed_solvent_displaced_volume
+  O:
+    value: 9.13
+    source: "Fraser, MacRae & Suzuki, J. Appl. Cryst. 11 (1978) 693-694, Table 1"
+    convention: observed_solvent_displaced_volume
+  S:
+    value: 19.86
+    source: "Traube/CRYSOL table as distributed by AUSAXS ExvTable"
+    convention: observed_solvent_displaced_volume

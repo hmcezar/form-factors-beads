@@ -1,0 +1,4 @@
+include README.md CHANGELOG.md
+recursive-include examples *.yaml
+recursive-include tests *.py
+recursive-include src/form_factors_beads/data *.yaml
