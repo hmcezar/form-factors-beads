@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import form_factors_beads as ff
+from form_factors_beads import core
 from form_factors_beads.core import _prepare_output
 
 
@@ -104,6 +105,43 @@ def test_q_grid_rejects_invalid_ranges():
         ff.q_grid({"minimum": 0.0, "maximum": 0.05, "step": 0.01})
 
 
+def test_sign_restoration_preserves_f0_and_explicit_crossing():
+    q = np.array([0.0, 0.5, 1.0])
+    amplitude = np.array([-2.0, 1.0, 2.0])
+    signed, crossover, note = ff.restore_amplitude_sign(amplitude, q, 0.5, 0.1)
+    assert signed[0] == pytest.approx(-2.0)
+    assert signed[1] == pytest.approx(0.0)
+    assert signed[2] > 0.0
+    assert crossover == 0.5
+    assert note is None
+
+
+def test_positive_contrast_does_not_invent_a_sign_crossing():
+    q = np.array([0.0, 0.5, 1.0])
+    signed, crossover, note = ff.restore_amplitude_sign(
+        np.array([2.0, 1.0, 0.5]), q, None, 0.1
+    )
+    np.testing.assert_array_equal(signed, [2.0, 1.0, 0.5])
+    assert crossover is None
+    assert note is None
+
+
+def test_xray_factor_requires_a_displaced_volume():
+    with pytest.raises(ValueError, match="No solvent-displaced SAXS volume"):
+        ff.xray_factors(
+            ["P"],
+            np.ones(1),
+            np.array([0.0, 0.1]),
+            density=0.334,
+            volumes={"C": 16.44},
+        )
+
+
+def test_isotope_override_cannot_change_the_element():
+    with pytest.raises(ValueError, match="changes atom 1 element"):
+        core.isotope_labels(["C"], {1: "N-15"})
+
+
 def test_graph_identity_distinguishes_connectivity():
     mapping = ff.MappingData(
         bead_order=("linear", "branched"),
@@ -129,6 +167,48 @@ def test_graph_identity_distinguishes_connectivity():
         {"force_groups": {}, "force_split": []},
     )
     assert list(groups.values()) == [["linear"], ["branched"]]
+
+
+def test_saxs_contrast_splits_otherwise_identical_graphs():
+    mapping = ff.MappingData(
+        bead_order=("B0", "B1"),
+        bead_atoms={"B0": (1, 2), "B1": (3, 4)},
+        atom_names={1: "C1", 2: "H1", 3: "C2", 4: "H2"},
+        atom_beads={1: ("B0",), 2: ("B0",), 3: ("B1",), 4: ("B1",)},
+        atom_count=4,
+    )
+    bonds = {(1, 2): "1", (3, 4): "1"}
+    common = {
+        "solvent_electron_density": 0.334,
+        "electron_density_overrides": {},
+    }
+    identity = {"force_groups": {}, "force_split": []}
+    merged = ff.group_equivalent_beads(
+        mapping, ["C", "H", "C", "H"], ["C", "H", "C", "H"], bonds, common, identity
+    )
+    assert list(merged.values()) == [["B0", "B1"]]
+
+    contrasted = copy.deepcopy(common)
+    contrasted["electron_density_overrides"] = {"B1": 0.214}
+    split = ff.group_equivalent_beads(
+        mapping,
+        ["C", "H", "C", "H"],
+        ["C", "H", "C", "H"],
+        bonds,
+        contrasted,
+        identity,
+    )
+    assert list(split.values()) == [["B0"], ["B1"]]
+
+
+def test_config_deep_merge_keeps_unspecified_defaults(tmp_path):
+    path = tmp_path / "settings.yaml"
+    path.write_text("fit:\n  low_q_weight: 9.0\n")
+    config, base = ff.load_config(path)
+    assert config["fit"]["low_q_weight"] == 9.0
+    assert config["fit"]["degree"] == 6
+    assert config["saxs"]["solvent_electron_density"] == pytest.approx(0.334)
+    assert base == tmp_path
 
 
 def test_atomic_volume_data_is_packaged():

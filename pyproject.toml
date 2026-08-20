@@ -42,6 +42,9 @@ form_factors_beads = ["data/*.yaml"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+markers = [
+  "integration: scientific regressions requiring the external TX9 trajectory",
+]
 
 [tool.ruff]
 line-length = 100
