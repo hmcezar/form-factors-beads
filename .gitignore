@@ -10,6 +10,8 @@ dist/
 results/
 form_factor_output/
 *.xtc
+!tests/data/tx9/*.xtc
+*.xtc_offsets.npz
 *.trr
 *.dcd
 *.nc

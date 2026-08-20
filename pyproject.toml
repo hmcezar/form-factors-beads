@@ -43,7 +43,7 @@ form_factors_beads = ["data/*.yaml"]
 addopts = "-ra"
 testpaths = ["tests"]
 markers = [
-  "integration: scientific regressions requiring the external TX9 trajectory",
+  "integration: self-contained scientific regressions using the compact TX9 fixture",
 ]
 
 [tool.ruff]

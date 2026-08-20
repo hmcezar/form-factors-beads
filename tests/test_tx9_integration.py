@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
-import os
 from pathlib import Path
 
 import numpy as np
@@ -43,28 +42,11 @@ def load_coefficient_reference() -> dict[str, np.ndarray]:
         }
 
 
-def locate_tx9_root(metadata: dict) -> Path:
-    configured = os.environ.get("FORM_FACTORS_BEADS_TX9_ROOT")
-    candidates = [Path(configured).expanduser()] if configured else []
-    # In the original development checkout the package repository sits at
-    # TX100/form_factors_beads/form-factors-beads.
-    candidates.append(Path(__file__).resolve().parents[3])
-    required = Path(metadata["inputs"]["trajectory"]["path"])
-    for candidate in candidates:
-        if (candidate / required).is_file():
-            return candidate.resolve()
-    pytest.skip(
-        "TX9 integration data not found; set FORM_FACTORS_BEADS_TX9_ROOT to "
-        "the directory containing cg_parametrization/"
-    )
-
-
 @pytest.fixture(scope="module")
 def tx9_regression():
     metadata = yaml.safe_load((DATA_DIR / "tx9_reference_metadata.yaml").read_text())
-    root = locate_tx9_root(metadata)
     paths = {
-        key: root / details["path"] for key, details in metadata["inputs"].items()
+        key: DATA_DIR / details["path"] for key, details in metadata["inputs"].items()
     }
     for key, path in paths.items():
         assert sha256(path) == metadata["inputs"][key]["sha256"], (
@@ -97,7 +79,7 @@ def tx9_regression():
             "mapping": paths["mapping"],
         },
         config,
-        root,
+        DATA_DIR,
     )
     reference_q, reference_curves = load_curve_reference()
     return result, metadata, reference_q, reference_curves
