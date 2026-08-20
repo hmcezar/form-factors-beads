@@ -1,0 +1,160 @@
+# Complete form-factors-beads configuration reference.
+#
+# YAML values override the built-in defaults. Paths inside a project-level
+# molecules list are resolved relative to this file. Paths passed directly
+# through --topology, --trajectory, and --mapping are resolved by the shell.
+
+# q: momentum-transfer grid in inverse angstroms (A^-1).
+q:
+  # minimum: first q value; the current implementation requires exactly 0.0.
+  minimum: 0.0
+  # maximum: exclusive upper bound, so 2.0 with step 0.01 ends at 1.99.
+  maximum: 2.0
+  # step: spacing between consecutive q values.
+  step: 0.01
+
+# trajectory: atom and frame selection applied by MDAnalysis.
+trajectory:
+  # selection: MDAnalysis atom-selection expression. The selected atom count
+  # must be a multiple of the mapping template size; multiple occurrences are
+  # checked for identical topology and averaged together.
+  selection: all
+  # start: zero-based index of the first trajectory frame to include.
+  start: 0
+  # stop: exclusive frame index, or null to continue through the last frame.
+  stop: null
+  # stride: analyze every Nth frame after applying start and stop.
+  stride: 1
+  # guess_bonds: infer bonds from the first frame when the topology has none.
+  # A bonded topology is preferred because guessing depends on geometry.
+  guess_bonds: false
+
+# fit: polynomial approximation applied independently to each bead group.
+fit:
+  # degree: polynomial order; 6 produces coefficients c0 through c6.
+  degree: 6
+  # enforce_f0: constrain c0 to the analytically calculated F(0).
+  enforce_f0: true
+  # low_q_max: inclusive upper edge of the high-priority low-q region (A^-1).
+  low_q_max: 0.75
+  # low_q_weight: residual weight assigned at q <= low_q_max; use 1.0 to
+  # disable preferential low-q fitting.
+  low_q_weight: 5.0
+
+# saxs: X-ray form-factor and solvent-contrast settings.
+saxs:
+  # enabled: calculate SAXS curves, fits, plots, and parameter fragments.
+  enabled: true
+  # solvent_electron_density: default solvent electron density in e/A^3.
+  solvent_electron_density: 0.334
+  # electron_density_overrides: bead- or automatic-group-specific densities.
+  # A bead key affects only that bead; group:<representative> affects every
+  # member of the automatically detected group. For example:
+  #
+  # electron_density_overrides:
+  #   B3: 0.300
+  #   group:B8: 0.214
+  electron_density_overrides: {}
+  # excluded_volume_overrides: solvent-displaced atomic volumes in A^3 for
+  # elements absent from the bundled H, D, C, N, O, and S table, or deliberate
+  # replacements for bundled values. For example: {P: 24.43}.
+  excluded_volume_overrides: {}
+
+# sans: neutron-scattering output modes and isotope substitutions.
+sans:
+  # polynomial: calculate geometry-dependent SANS curves and polynomial fits.
+  polynomial: true
+  # one_parameter: write the geometry-independent coherent scattering length
+  # for each bead as a PLUMED SCATLENn value.
+  one_parameter: true
+  # isotope_overrides: map a 1-based atom index in the mapping template to an
+  # isotope label. Accepted forms include D, T, 13C, and C-13. For example:
+  #
+  # isotope_overrides:
+  #   14: D
+  #   27: C-13
+  isotope_overrides: {}
+
+# element_overrides: correct element assignment for ambiguous topology atom
+# names. Keys are 1-based atom indices in the mapping template. Values are
+# element symbols; unlike isotope_overrides, this affects both SAXS and SANS.
+# Example: {1: C, 12: Cl}.
+element_overrides: {}
+
+# identity: controls automatic bonded-graph detection of equivalent beads.
+identity:
+  # force_groups: explicitly average selected beads under a chosen group name.
+  # This is useful when the desired CG equivalence intentionally ignores an
+  # atomistic boundary difference. Example: {B2/B4: [B2, B4]}.
+  force_groups: {}
+  # force_split: bead names that must remain independent even when their
+  # labeled molecular graphs are otherwise identical. Example: [B6, B7].
+  force_split: []
+
+# sign: restores signed amplitudes when F(0) has negative contrast.
+sign:
+  # default_width: default tanh transition width in A^-1.
+  default_width: 0.03
+  # crossovers: optional explicit zero-crossing q values by method and bead or
+  # group name. Omitted negative-contrast curves use the minimum magnitude.
+  #
+  # crossovers:
+  #   saxs:
+  #     B0: 0.58
+  #   sans:
+  #     B1: 0.31
+  crossovers: {}
+  # widths: optional transition-width overrides by method and bead/group.
+  #
+  # widths:
+  #   saxs:
+  #     B0: 0.02
+  #   sans:
+  #     B1: 0.10
+  widths: {}
+
+# plot: controls optional content in the diagnostic fit figure.
+plot:
+  # show_positive_magnitude: draw the original non-negative sqrt(I(q)) amplitude
+  # as a dotted line in the same group color. The signed curve remains solid
+  # and the polynomial fit remains dashed.
+  show_positive_magnitude: true
+
+# molecules: optional project mode for processing several molecular species in
+# one invocation. Leave this section commented when supplying one molecule via
+# --topology, --trajectory, --mapping, and optionally --name. Uncomment and
+# adapt the example below to enable project mode.
+#
+# molecules:
+#   # name: prefix used for this molecule's output files.
+#   - name: molecule_a
+#     # topology: bonded atomistic topology readable by MDAnalysis.
+#     topology: structures/molecule_a.pdb
+#     # trajectory: optional coordinate trajectory; omit it to use coordinates
+#     # contained in the topology as a single frame.
+#     trajectory: trajectories/molecule_a.xtc
+#     # mapping: CGBuilder mapping with [martini] and [atoms] sections.
+#     mapping: mappings/molecule_a.map
+#     # count: number of copies in the target CG mixture. Counts greater than
+#     # one generate expanded project_*.inp parameter fragments.
+#     count: 100
+#     # settings: per-molecule deep overrides of any global scientific setting.
+#     settings:
+#       saxs:
+#         electron_density_overrides:
+#           B8: 0.214
+#       sans:
+#         isotope_overrides:
+#           14: D
+#       identity:
+#         force_groups:
+#           B2/B4: [B2, B4]
+#       sign:
+#         crossovers:
+#           saxs:
+#             B0: 0.58
+#
+#   - name: molecule_b
+#     topology: structures/molecule_b.pdb
+#     mapping: mappings/molecule_b.map
+#     count: 50

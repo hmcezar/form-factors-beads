@@ -15,7 +15,7 @@ For every mapped molecule type, the command writes:
 | `*_saxs_parameters.inp` | SAXS `PARAMETERSn=c0,...,c6` fragment |
 | `*_sans_parameters.inp` | Geometry-dependent SANS polynomial fragment |
 | `*_sans_scattering_lengths.inp` | One-parameter SANS `SCATLENn=b` fragment |
-| `*_form_factor_fits.png` | Curves, fits, weighted low-q region, and residuals |
+| `*_form_factor_fits.png` | Signed curves, positive magnitudes, fits, weighted low-q region, and residuals |
 | `*_curves.csv`, `*_coefficients.csv` | Machine-readable curves and coefficients |
 | `*_report.yaml` | Groups, errors, crossings, input hashes, versions, and units |
 
@@ -47,7 +47,7 @@ form-factors-beads \
   --topology molecule.pdb \
   --trajectory trajectory.xtc \
   --mapping molecule.map \
-  --config examples/basic.yaml \
+  --config examples/example.yaml \
   --output results/molecule
 ```
 
@@ -57,7 +57,7 @@ Validate the complete calculation without writing outputs:
 form-factors-beads \
   --topology molecule.pdb \
   --mapping molecule.map \
-  --config examples/basic.yaml \
+  --config examples/example.yaml \
   --dry-run
 ```
 
@@ -116,9 +116,15 @@ F_SANS(0) = sum_i w_i b_i
 The report also records the unconstrained extrapolation and the low-q RMSE and
 maximum error.
 
+Diagnostic plots draw the signed form factor as a solid line, its polynomial
+fit as a dashed line, and the original non-negative `sqrt(I(q))` magnitude as a
+dotted line in the same bead-group color. Set
+`plot.show_positive_magnitude: false` to hide the dotted reference curves.
+
 ## YAML configuration
 
-See [`examples/basic.yaml`](examples/basic.yaml) for all common settings. A
+See [`examples/example.yaml`](examples/example.yaml) for a commented reference
+covering every configuration key. A
 project file may define several molecule types:
 
 ```yaml

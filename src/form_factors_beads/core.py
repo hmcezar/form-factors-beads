@@ -26,6 +26,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import MDAnalysis as mda
 from MDAnalysis.exceptions import NoDataError
 from MDAnalysis.guesser.default_guesser import DefaultGuesser
@@ -69,6 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "identity": {"force_groups": {}, "force_split": []},
     "sign": {"default_width": 0.03, "crossovers": {}, "widths": {}},
+    "plot": {"show_positive_magnitude": True},
     "element_overrides": {},
 }
 
@@ -791,6 +793,7 @@ def calculate_molecule(
     for method in enabled_methods:
         bead_curves = {bead: sums[method][bead] / sample_count for bead in mapping.bead_order}
         group_curves: OrderedDict[str, np.ndarray] = OrderedDict()
+        positive_magnitude_curves: OrderedDict[str, np.ndarray] = OrderedDict()
         coefficients: OrderedDict[str, np.ndarray] = OrderedDict()
         metrics: OrderedDict[str, dict[str, Any]] = OrderedDict()
         crossovers: OrderedDict[str, float | None] = OrderedDict()
@@ -821,6 +824,7 @@ def calculate_molecule(
                 bool(config["fit"].get("enforce_f0", True)),
             )
             group_curves[group] = signed
+            positive_magnitude_curves[group] = np.abs(curve)
             coefficients[group] = coeff
             metrics[group] = {**fit_metrics, "members": list(members), "sign_width": width}
             crossovers[group] = crossover
@@ -832,6 +836,7 @@ def calculate_molecule(
         method_results[method] = {
             "bead_curves": bead_curves,
             "group_curves": group_curves,
+            "positive_magnitude_curves": positive_magnitude_curves,
             "coefficients": coefficients,
             "bead_coefficients": bead_coefficients,
             "metrics": metrics,
@@ -929,7 +934,13 @@ def write_coefficients(path: Path, result: MoleculeResult, method: str, force: b
             writer.writerow([group, *values])
 
 
-def plot_fits(path: Path, result: MoleculeResult, low_q_max: float, force: bool) -> None:
+def plot_fits(
+    path: Path,
+    result: MoleculeResult,
+    low_q_max: float,
+    force: bool,
+    show_positive_magnitude: bool = True,
+) -> None:
     methods = list(result.methods)
     figure, axes = plt.subplots(2, len(methods), figsize=(8 * len(methods), 9), squeeze=False)
     for column, method in enumerate(methods):
@@ -938,6 +949,16 @@ def plot_fits(path: Path, result: MoleculeResult, low_q_max: float, force: bool)
             coefficients = result.methods[method]["coefficients"][group]
             fitted = np.polynomial.polynomial.polyval(result.q, coefficients)
             line = top.plot(result.q, curve, label=group)[0]
+            if show_positive_magnitude:
+                positive = result.methods[method]["positive_magnitude_curves"][group]
+                top.plot(
+                    result.q,
+                    positive,
+                    ":",
+                    color=line.get_color(),
+                    alpha=0.75,
+                    zorder=line.get_zorder() - 1,
+                )
             top.plot(result.q, fitted, "--", color=line.get_color(), alpha=0.85)
             bottom.plot(result.q, fitted - curve, color=line.get_color(), label=group)
         for axis in (top, bottom):
@@ -946,8 +967,22 @@ def plot_fits(path: Path, result: MoleculeResult, low_q_max: float, force: bool)
             axis.set_xlabel(r"$q$ ($\AA^{-1}$)")
         top.set_title(f"{result.name} {method.upper()}")
         top.set_ylabel("bead form-factor amplitude")
-        top.legend(ncols=2, fontsize=8)
-        bottom.set_ylabel("polynomial - form factor")
+        style_handles = [
+            Line2D([], [], color="0.25", linestyle="-", label="signed form factor"),
+            Line2D([], [], color="0.25", linestyle="--", label="polynomial fit"),
+        ]
+        if show_positive_magnitude:
+            style_handles.append(
+                Line2D([], [], color="0.25", linestyle=":", label="positive magnitude")
+            )
+        group_handles, group_labels = top.get_legend_handles_labels()
+        top.legend(
+            handles=[*group_handles, *style_handles],
+            labels=[*group_labels, *[handle.get_label() for handle in style_handles]],
+            ncols=2,
+            fontsize=8,
+        )
+        bottom.set_ylabel("residuals")
     figure.tight_layout()
     if path.exists() and not force:
         plt.close(figure)
@@ -1014,6 +1049,7 @@ def write_result(output: Path, result: MoleculeResult, config: Mapping[str, Any]
         result,
         float(config["fit"]["low_q_max"]),
         force,
+        bool(config.get("plot", {}).get("show_positive_magnitude", True)),
     )
     report = yaml.safe_dump(_plain(result_report(result, config)), sort_keys=False)
     _write_text(Path(f"{prefix}_report.yaml"), report, force)
@@ -1073,8 +1109,9 @@ def write_project_outputs(
 def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     configured = config.get("molecules")
     if configured:
-        if args.topology or args.trajectory or args.mapping:
-            raise ValueError("CLI molecule paths cannot be combined with YAML molecules")
+        cli_molecule_values = (args.topology, args.trajectory, args.mapping, args.name)
+        if any(value is not None for value in cli_molecule_values):
+            raise ValueError("CLI molecule arguments cannot be combined with YAML molecules")
         specs = [dict(item) for item in configured]
     else:
         if args.topology is None or args.mapping is None:

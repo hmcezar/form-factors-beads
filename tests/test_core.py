@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import copy
 from pathlib import Path
 
@@ -211,6 +212,23 @@ def test_config_deep_merge_keeps_unspecified_defaults(tmp_path):
     assert base == tmp_path
 
 
+def test_documented_example_config_loads():
+    path = Path(__file__).resolve().parents[1] / "examples" / "example.yaml"
+    config, base = ff.load_config(path)
+    assert base == path.parent
+    assert config == ff.DEFAULT_CONFIG
+
+
+@pytest.mark.parametrize("option", ["topology", "trajectory", "mapping", "name"])
+def test_project_mode_rejects_cli_molecule_arguments(option):
+    values = {"topology": None, "trajectory": None, "mapping": None, "name": None}
+    values[option] = "command-line-value"
+    args = Namespace(**values)
+    config = {"molecules": [{"name": "from-yaml", "mapping": "molecule.map"}]}
+    with pytest.raises(ValueError, match="CLI molecule arguments cannot be combined"):
+        core._molecule_specs(args, config)
+
+
 def test_atomic_volume_data_is_packaged():
     volumes, provenance = ff.load_atomic_volumes({})
     assert volumes["H"] == pytest.approx(5.15)
@@ -249,6 +267,9 @@ def test_minimal_end_to_end_calculation_and_outputs(tmp_path):
     assert set(result.methods) == {"saxs", "sans"}
     assert all(values[0] == pytest.approx(result.methods["saxs"]["metrics"][group]["f0_true"])
                for group, values in result.methods["saxs"]["coefficients"].items())
+    for method in result.methods.values():
+        for magnitude in method["positive_magnitude_curves"].values():
+            assert np.all(magnitude >= 0.0)
 
     output = tmp_path / "results"
     _prepare_output(output, force=False)
