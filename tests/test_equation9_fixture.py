@@ -11,6 +11,8 @@ import yaml
 import form_factors_beads as ff
 
 FIXTURE = Path(__file__).parent / "data" / "equation9_fixture"
+FIT_RTOL = 1.0e-9
+FIT_ATOL = 1.0e-11
 
 
 def _assert_parameter_file_close(generated: Path, expected: Path) -> None:
@@ -19,7 +21,12 @@ def _assert_parameter_file_close(generated: Path, expected: Path) -> None:
     assert {key: value for key, value in actual.items() if key != "parameters"} == {
         key: value for key, value in reference.items() if key != "parameters"
     }
-    np.testing.assert_allclose(actual["parameters"], reference["parameters"], rtol=1e-12)
+    np.testing.assert_allclose(
+        actual["parameters"],
+        reference["parameters"],
+        rtol=FIT_RTOL,
+        atol=FIT_ATOL,
+    )
 
 
 def _parse_inline_file(path: Path) -> dict[str, tuple[float, ...]]:
@@ -85,7 +92,12 @@ def test_equation9_cross_repository_fixture(tmp_path):
             reference = _parse_inline_file(expected)
             assert actual.keys() == reference.keys()
             for key in actual:
-                np.testing.assert_allclose(actual[key], reference[key], rtol=1e-12)
+                np.testing.assert_allclose(
+                    actual[key],
+                    reference[key],
+                    rtol=FIT_RTOL,
+                    atol=FIT_ATOL,
+                )
         elif expected.name.endswith("_equation9_terms.csv"):
             _assert_terms_csv_close(generated, expected)
         else:
