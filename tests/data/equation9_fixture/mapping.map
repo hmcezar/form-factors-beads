@@ -1,0 +1,11 @@
+[ to ]
+martini
+
+[ martini ]
+B0 B1
+
+[ atoms ]
+1 O1 B0
+2 H1 B0
+3 C1 B0 B1
+4 N1 B1

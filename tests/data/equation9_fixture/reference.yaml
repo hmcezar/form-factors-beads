@@ -1,0 +1,23 @@
+format_version: 1
+purpose: Cross-repository Equation-9 and LCPO acceptance fixture
+expected:
+  exchangeable_hydrogens: [2]
+  exchangeable_beads: [B0]
+  exposure_comparison:
+    accessible_fraction_cutoff: 0.85
+    mismatch_fraction: 0.5
+    confusion_matrix:
+      both_exposed: 0
+      hybrid_only: 0
+      cg_only: 1
+      both_buried: 1
+    per_bead:
+      B0:
+        hybrid_mean_fraction: 0.7993669540718161
+        cg_mean_fraction: 0.9229995592127159
+      B1:
+        hybrid_mean_fraction: 0.7845197449388367
+        cg_mean_fraction: 0.8425769521595831
+  reconstruction_max_abs_error:
+    saxs: 7.0e-15
+    sans: 0.0
