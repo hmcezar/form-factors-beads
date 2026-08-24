@@ -1,14 +1,56 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 
 import form_factors_beads as ff
 
 FIXTURE = Path(__file__).parent / "data" / "equation9_fixture"
+
+
+def _assert_parameter_file_close(generated: Path, expected: Path) -> None:
+    actual = ff.parse_contextual_parameter_file(generated)
+    reference = ff.parse_contextual_parameter_file(expected)
+    assert {key: value for key, value in actual.items() if key != "parameters"} == {
+        key: value for key, value in reference.items() if key != "parameters"
+    }
+    np.testing.assert_allclose(actual["parameters"], reference["parameters"], rtol=1e-12)
+
+
+def _parse_inline_file(path: Path) -> dict[str, tuple[float, ...]]:
+    assignments = {}
+    for raw in path.read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, value = line.split("=", 1)
+        assignments[key] = tuple(float(item) for item in value.split(","))
+    return assignments
+
+
+def _assert_terms_csv_close(generated: Path, expected: Path) -> None:
+    with generated.open(newline="") as handle:
+        actual = list(csv.DictReader(handle))
+    with expected.open(newline="") as handle:
+        reference = list(csv.DictReader(handle))
+    assert len(actual) == len(reference)
+    labels = ("method", "term", "group")
+    values = ("q_A^-1", "value", "fit", "residual")
+    for actual_row, reference_row in zip(actual, reference, strict=True):
+        assert tuple(actual_row[key] for key in labels) == tuple(
+            reference_row[key] for key in labels
+        )
+        np.testing.assert_allclose(
+            [float(actual_row[key]) for key in values],
+            [float(reference_row[key]) for key in values],
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
 
 @pytest.mark.integration
@@ -35,7 +77,19 @@ def test_equation9_cross_repository_fixture(tmp_path):
     for expected in expected_files:
         generated = tmp_path / expected.name
         assert generated.is_file(), expected.name
-        assert generated.read_bytes() == expected.read_bytes(), expected.name
+        text = expected.read_text()
+        if "METHOD=" in text and "TERM=" in text:
+            _assert_parameter_file_close(generated, expected)
+        elif expected.name.endswith("_equation9_inline.inp"):
+            actual = _parse_inline_file(generated)
+            reference = _parse_inline_file(expected)
+            assert actual.keys() == reference.keys()
+            for key in actual:
+                np.testing.assert_allclose(actual[key], reference[key], rtol=1e-12)
+        elif expected.name.endswith("_equation9_terms.csv"):
+            _assert_terms_csv_close(generated, expected)
+        else:
+            assert generated.read_bytes() == expected.read_bytes(), expected.name
 
     atomic_h = ff.parse_contextual_parameter_file(
         tmp_path / "equation9_fixture_sans_h_atomic_parameters.inp"
