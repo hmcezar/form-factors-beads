@@ -120,6 +120,41 @@ plot:
   # and the polynomial fit remains dashed.
   show_positive_magnitude: true
 
+# decomposition: opt-in Equation-9 and automatic-solvation export for PLUMED.
+# The legacy parameter fragments above are unchanged when this is disabled.
+decomposition:
+  # enabled: calculate and write separate atomic, solvent, and mixed terms.
+  enabled: false
+  # representations: export atomistic hybrid mapping/LCPO parameters, native-CG
+  # effective LCPO parameters, or both.
+  representations: [hybrid, cg]
+  lcpo:
+    # allow_element_fallback: use documented C/N/O/P/S/F/Mg tuples when a
+    # residue_name/atom_name pair is absent from PLUMED's database. Every use warns.
+    allow_element_fallback: true
+    # Native-CG radii are always derived from the summed, shared-atom-adjusted
+    # displaced volume. Bead overrides below remain available when necessary.
+    # atom_overrides: five-value radius,p1,p2,p3,p4 tuples keyed by 1-based
+    # mapping-template atom index. Atom overrides have highest precedence.
+    atom_overrides: {}
+    # element_overrides: deliberate five-value replacements keyed by element.
+    element_overrides: {}
+    # bead_overrides: replace a derived native-CG tuple by bead name.
+    bead_overrides: {}
+    # probe_radius_A: water-probe radius used only for LCPO diagnostics. Output
+    # tuples contain base radii; PLUMED adds the same probe at run time.
+    probe_radius_A: 1.4
+  diagnostics:
+    # accessible_fraction_cutoff: diagnostic-only exposed/buried threshold used
+    # to compare atomistic hybrid and effective native-CG LCPO fractions. It
+    # does not alter any generated parameter.
+    accessible_fraction_cutoff: 0.2
+  exchange:
+    # include/exclude: 1-based hydrogen indices overriding automatic detection
+    # of H bonded to N, O, or S for the SANS H/D end-state files.
+    include: []
+    exclude: []
+
 # molecules: optional project mode for processing several molecular species in
 # one invocation. Leave this section commented when supplying one molecule via
 # --topology, --trajectory, --mapping, and optionally --name. Uncomment and

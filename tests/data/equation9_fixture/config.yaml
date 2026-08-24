@@ -1,0 +1,10 @@
+q:
+  minimum: 0.0
+  maximum: 0.40
+  step: 0.05
+fit:
+  degree: 3
+  low_q_max: 0.20
+decomposition:
+  enabled: true
+  representations: [hybrid, cg]

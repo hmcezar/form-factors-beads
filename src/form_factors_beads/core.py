@@ -18,26 +18,39 @@ import re
 import sys
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import MDAnalysis as mda
+import networkx as nx
+import numpy as np
+import periodictable as pt
+import yaml
+from matplotlib.lines import Line2D
 from MDAnalysis.exceptions import NoDataError
 from MDAnalysis.guesser.default_guesser import DefaultGuesser
 from MDAnalysis.lib.distances import distance_array
-import networkx as nx
 from networkx.algorithms import isomorphism
-import numpy as np
-import periodictable as pt
 from periodictable import cromermann
-import yaml
 
+from .decomposition import (
+    LCPOAssignment,
+    aggregate_hybrid_accessible_fractions,
+    assign_lcpo_parameters,
+    debye_component_terms,
+    derive_cg_lcpo_parameters,
+    detect_exchangeable_hydrogens,
+    equation9_radicand,
+    lcpo_areas,
+    normalized_mass_weights,
+    virtual_center_positions,
+)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 ATOMIC_VOLUME_FILE = PACKAGE_DIR / "data" / "atomic_volumes.yaml"
@@ -72,6 +85,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sign": {"default_width": 0.03, "crossovers": {}, "widths": {}},
     "plot": {"show_positive_magnitude": True},
     "element_overrides": {},
+    "decomposition": {
+        "enabled": False,
+        "representations": ["hybrid", "cg"],
+        "lcpo": {
+            "allow_element_fallback": True,
+            "atom_overrides": {},
+            "element_overrides": {},
+            "bead_overrides": {},
+            "probe_radius_A": 1.4,
+        },
+        "diagnostics": {"accessible_fraction_cutoff": 0.2},
+        "exchange": {"include": [], "exclude": []},
+    },
 }
 
 
@@ -96,6 +122,7 @@ class MoleculeResult:
     sans_one_parameter: dict[str, float]
     warnings: list[str]
     provenance: dict[str, Any]
+    decomposition: dict[str, Any] | None = None
 
 
 def _deep_update(base: dict[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
@@ -130,7 +157,7 @@ def read_cgbuilder_mapping(path: str | Path) -> MappingData:
     sections: dict[str, list[list[str]]] = {}
     section: str | None = None
     with Path(path).open() as handle:
-        for line_number, raw in enumerate(handle, start=1):
+        for raw in handle:
             line = _strip_comment(raw)
             if not line:
                 continue
@@ -344,8 +371,10 @@ def _bond_table(
             raise ValueError(
                 "The topology has no bonds. Supply a bonded topology or explicitly "
                 "set trajectory.guess_bonds: true."
-            )
-        warnings.warn("Guessing bonds from the first trajectory frame", RuntimeWarning)
+            ) from None
+        warnings.warn(
+            "Guessing bonds from the first trajectory frame", RuntimeWarning, stacklevel=2
+        )
         universe.atoms.guess_bonds()
         bonds = universe.bonds
     reverse = {global_index: local + 1 for local, global_index in enumerate(occurrence)}
@@ -533,15 +562,18 @@ def group_equivalent_beads(
     return ordered
 
 
-def xray_factors(
+def xray_component_factors(
     labels: list[str],
     weights: np.ndarray,
     q: np.ndarray,
-    density: float,
     volumes: Mapping[str, float],
-) -> np.ndarray:
-    factors = np.empty((q.size, len(labels)), dtype=float)
-    missing = sorted({base_element(label) for label in labels if base_element(label) not in volumes})
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return density-independent SAXS atomic and displaced-volume factors."""
+    atomic = np.empty((q.size, len(labels)), dtype=float)
+    solvent = np.empty((q.size, len(labels)), dtype=float)
+    missing = sorted(
+        {base_element(label) for label in labels if base_element(label) not in volumes}
+    )
     if missing:
         raise ValueError(
             "No solvent-displaced SAXS volume for "
@@ -552,16 +584,54 @@ def xray_factors(
         element = base_element(label)
         free_atom = np.asarray(cromermann.fxrayatq(element, q), dtype=float)
         volume = volumes[element]
-        displaced = density * volume * np.exp(
+        displaced_volume = volume * np.exp(
             -(q**2) * volume ** (2.0 / 3.0) / (4.0 * np.pi)
         )
-        factors[:, index] = weights[index] * (free_atom - displaced)
-    return factors
+        atomic[:, index] = weights[index] * free_atom
+        solvent[:, index] = weights[index] * displaced_volume
+    return atomic, solvent
+
+
+def xray_factors(
+    labels: list[str],
+    weights: np.ndarray,
+    q: np.ndarray,
+    density: float,
+    volumes: Mapping[str, float],
+) -> np.ndarray:
+    atomic, solvent = xray_component_factors(labels, weights, q, volumes)
+    return atomic - density * solvent
 
 
 def sans_factors(labels: list[str], weights: np.ndarray, q: np.ndarray) -> np.ndarray:
     values = weights * np.asarray([neutron_length(label) for label in labels])
     return np.broadcast_to(values, (q.size, values.size)).copy()
+
+
+def sans_component_factors(
+    labels: list[str],
+    weights: np.ndarray,
+    q: np.ndarray,
+    volumes: Mapping[str, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return SANS atomic scattering lengths and displaced-volume factors."""
+    atomic = sans_factors(labels, weights, q)
+    missing = sorted(
+        {base_element(label) for label in labels if base_element(label) not in volumes}
+    )
+    if missing:
+        raise ValueError(
+            "No solvent-displaced SANS volume for "
+            + ", ".join(missing)
+            + "; provide saxs.excluded_volume_overrides"
+        )
+    solvent = np.empty_like(atomic)
+    for index, label in enumerate(labels):
+        volume = volumes[base_element(label)]
+        solvent[:, index] = weights[index] * volume * np.exp(
+            -(q**2) * volume ** (2.0 / 3.0) / (4.0 * np.pi)
+        )
+    return atomic, solvent
 
 
 def debye_amplitude(
@@ -649,6 +719,84 @@ def fit_polynomial(
     return coefficients, metrics
 
 
+def _fit_decomposed_terms(
+    sums: Mapping[str, Mapping[str, np.ndarray]],
+    sample_count: int,
+    groups: Mapping[str, list[str]],
+    q: np.ndarray,
+    fit_settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Average and fit every Equation-9 component without applying contrast."""
+    result: dict[str, Any] = {"terms": {}}
+    for term, bead_sums in sums.items():
+        bead_curves = {
+            bead: np.asarray(values, dtype=float) / sample_count
+            for bead, values in bead_sums.items()
+        }
+        group_curves: OrderedDict[str, np.ndarray] = OrderedDict()
+        coefficients: OrderedDict[str, np.ndarray] = OrderedDict()
+        metrics: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for group, members in groups.items():
+            curve = np.mean([bead_curves[bead] for bead in members], axis=0)
+            fitted, fit_metrics = fit_polynomial(
+                q,
+                curve,
+                int(fit_settings["degree"]),
+                float(fit_settings["low_q_max"]),
+                float(fit_settings["low_q_weight"]),
+                bool(fit_settings.get("enforce_f0", True)),
+            )
+            group_curves[group] = curve
+            coefficients[group] = fitted
+            metrics[group] = {**fit_metrics, "members": list(members)}
+        result["terms"][term] = {
+            "bead_curves": bead_curves,
+            "group_curves": group_curves,
+            "coefficients": coefficients,
+            "bead_coefficients": {
+                bead: coefficients[group]
+                for group, members in groups.items()
+                for bead in members
+            },
+            "metrics": metrics,
+        }
+    return result
+
+
+def _decomposition_reconstruction_diagnostics(
+    method: str,
+    decomposition: dict[str, Any],
+    legacy_curves: Mapping[str, np.ndarray],
+    groups: Mapping[str, list[str]],
+    densities: Mapping[str, float],
+) -> dict[str, Any]:
+    """Compare decomposed magnitudes with the legacy averaged amplitudes."""
+    diagnostics: dict[str, Any] = {}
+    terms = decomposition["terms"]
+    for bead, legacy in legacy_curves.items():
+        if method == "saxs":
+            selected = {
+                name: terms[name]["bead_curves"][bead]
+                for name in ("atomic", "solvent", "mixed")
+            }
+        else:
+            selected = {
+                "atomic": terms["atomic_h"]["bead_curves"][bead],
+                "solvent": terms["solvent"]["bead_curves"][bead],
+                "mixed": terms["mixed_h"]["bead_curves"][bead],
+            }
+        reconstructed = np.sqrt(equation9_radicand(selected, float(densities[bead])))
+        difference = reconstructed - np.abs(legacy)
+        diagnostics[bead] = {
+            "reference_density": float(densities[bead]),
+            "rmse": float(np.sqrt(np.mean(difference**2))),
+            "max_abs_error": float(np.max(np.abs(difference))),
+        }
+    decomposition["reconstruction"] = diagnostics
+    decomposition["group_members"] = copy.deepcopy(dict(groups))
+    return diagnostics
+
+
 def _file_sha256(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -687,6 +835,17 @@ def calculate_molecule(
     mapping = read_cgbuilder_mapping(mapping_path)
     universe = mda.Universe(str(topology), *([str(trajectory)] if trajectory else []))
     trajectory_settings = config["trajectory"]
+    start = int(trajectory_settings.get("start", 0))
+    stop_value = trajectory_settings.get("stop")
+    stop = None if stop_value is None else int(stop_value)
+    stride = int(trajectory_settings.get("stride", 1))
+    if (
+        start < 0
+        or start >= len(universe.trajectory)
+        or (stop is not None and stop <= start)
+        or stride < 1
+    ):
+        raise ValueError("invalid trajectory start/stop/stride")
     selected_indices, occurrences = _selected_occurrences(
         universe, str(trajectory_settings["selection"]), mapping.atom_count
     )
@@ -727,6 +886,106 @@ def calculate_molecule(
         config["saxs"].get("excluded_volume_overrides", {})
     )
 
+    decomposition_enabled = bool(config.get("decomposition", {}).get("enabled", False))
+    decomposition_payload: dict[str, Any] | None = None
+    exchangeable_hydrogens: tuple[int, ...] = ()
+    exchanged_isotopes = list(isotopes)
+    lcpo_assignments: list[LCPOAssignment] = []
+    if decomposition_enabled:
+        # The isolated-SASA radius model is defined on the first frame included
+        # by the configured trajectory slice, not necessarily trajectory frame 0.
+        universe.trajectory[start]
+        decomposition_settings = config["decomposition"]
+        representations = [
+            str(value).lower() for value in decomposition_settings["representations"]
+        ]
+        if not representations or set(representations) - {"hybrid", "cg"}:
+            raise ValueError("decomposition.representations must contain hybrid and/or cg")
+        template_atoms = universe.atoms[occurrences[0]]
+        atom_names = [str(value) for value in template_atoms.names]
+        residue_names = [str(value) for value in template_atoms.resnames]
+        lcpo_settings = decomposition_settings["lcpo"]
+        allowed_lcpo_settings = {
+            "allow_element_fallback",
+            "atom_overrides",
+            "element_overrides",
+            "bead_overrides",
+            "probe_radius_A",
+        }
+        unknown_lcpo_settings = sorted(set(lcpo_settings) - allowed_lcpo_settings)
+        if unknown_lcpo_settings:
+            raise ValueError(
+                "unsupported decomposition.lcpo settings: "
+                f"{unknown_lcpo_settings}"
+            )
+        diagnostic_settings = decomposition_settings.get("diagnostics", {})
+        unknown_diagnostic_settings = sorted(
+            set(diagnostic_settings) - {"accessible_fraction_cutoff"}
+        )
+        if unknown_diagnostic_settings:
+            raise ValueError(
+                "unsupported decomposition.diagnostics settings: "
+                f"{unknown_diagnostic_settings}"
+            )
+        lcpo_assignments, lcpo_provenance = assign_lcpo_parameters(
+            atom_names, residue_names, elements, lcpo_settings
+        )
+        exchange_settings = decomposition_settings.get("exchange", {})
+        exchangeable_hydrogens = detect_exchangeable_hydrogens(
+            elements,
+            bonds,
+            exchange_settings.get("include", []),
+            exchange_settings.get("exclude", []),
+        )
+        for atom_index in exchangeable_hydrogens:
+            exchanged_isotopes[atom_index - 1] = "D"
+        try:
+            template_masses = np.asarray(template_atoms.masses, dtype=float)
+        except NoDataError:
+            template_masses = np.asarray(
+                [float(pt.elements.symbol(element).mass) for element in elements], dtype=float
+            )
+        mapping_weights = {
+            bead: normalized_mass_weights(
+                [template_masses[index - 1] for index in mapping.bead_atoms[bead]]
+            )
+            for bead in mapping.bead_order
+        }
+        cg_lcpo, cg_lcpo_details = derive_cg_lcpo_parameters(
+            mapping.bead_order,
+            mapping.bead_atoms,
+            mapping.atom_beads,
+            elements,
+            volumes,
+            lcpo_assignments,
+            lcpo_settings,
+        )
+        decomposition_payload = {
+            "representations": representations,
+            "mapping": {
+                "atom_count": mapping.atom_count,
+                "bead_atoms": copy.deepcopy(dict(mapping.bead_atoms)),
+                "bead_weights": mapping_weights,
+                "index_convention": "one-based template serials",
+            },
+            "lcpo": {
+                "hybrid": lcpo_assignments,
+                "cg": cg_lcpo,
+                "provenance": lcpo_provenance,
+                "cg_derivation": cg_lcpo_details,
+            },
+            "exchange": {
+                "exchangeable_hydrogens": exchangeable_hydrogens,
+                "eligible_beads": {
+                    bead: any(
+                        index in exchangeable_hydrogens for index in mapping.bead_atoms[bead]
+                    )
+                    for bead in mapping.bead_order
+                },
+            },
+            "methods": {},
+        }
+
     fractions = {
         bead: np.asarray(
             [1.0 / len(mapping.atom_beads[index]) for index in mapping.bead_atoms[bead]],
@@ -740,10 +999,16 @@ def calculate_molecule(
         for key, value in config["saxs"].get("electron_density_overrides", {}).items()
     }
     factors: dict[str, dict[str, np.ndarray]] = {"saxs": {}, "sans": {}}
+    component_factors: dict[str, dict[str, dict[str, np.ndarray]]] = {
+        "saxs": {},
+        "sans_h": {},
+        "sans_d": {},
+    }
     sans_one = {}
     for bead in mapping.bead_order:
         local = mapping.bead_atoms[bead]
         bead_labels = [isotopes[index - 1] for index in local]
+        bead_exchanged_labels = [exchanged_isotopes[index - 1] for index in local]
         if config["saxs"].get("enabled", True):
             factors["saxs"][bead] = xray_factors(
                 bead_labels,
@@ -752,9 +1017,32 @@ def calculate_molecule(
                 density_overrides.get(bead, density_default),
                 volumes,
             )
+            if decomposition_enabled:
+                atomic, solvent = xray_component_factors(
+                    bead_labels, fractions[bead], q, volumes
+                )
+                component_factors["saxs"][bead] = {
+                    "atomic": atomic,
+                    "solvent": solvent,
+                }
         factors["sans"][bead] = sans_factors(
             bead_labels, fractions[bead], q
         )
+        if decomposition_enabled:
+            atomic_h, solvent = sans_component_factors(
+                bead_labels, fractions[bead], q, volumes
+            )
+            atomic_d, _ = sans_component_factors(
+                bead_exchanged_labels, fractions[bead], q, volumes
+            )
+            component_factors["sans_h"][bead] = {
+                "atomic": atomic_h,
+                "solvent": solvent,
+            }
+            component_factors["sans_d"][bead] = {
+                "atomic": atomic_d,
+                "solvent": solvent,
+            }
         sans_one[bead] = float(factors["sans"][bead][0].sum())
 
     enabled_methods = []
@@ -766,17 +1054,61 @@ def calculate_molecule(
         method: {bead: np.zeros_like(q) for bead in mapping.bead_order}
         for method in enabled_methods
     }
+    decomposed_sums: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+    exposure_samples: dict[str, dict[str, list[float]]] = {
+        bead: {"hybrid": [], "cg": []} for bead in mapping.bead_order
+    }
+    if decomposition_enabled:
+        if config["saxs"].get("enabled", True):
+            decomposed_sums["saxs"] = {
+                term: {bead: np.zeros_like(q) for bead in mapping.bead_order}
+                for term in ("atomic", "solvent", "mixed")
+            }
+        if config["sans"].get("polynomial", True):
+            decomposed_sums["sans"] = {
+                term: {bead: np.zeros_like(q) for bead in mapping.bead_order}
+                for term in ("atomic_h", "mixed_h", "atomic_d", "mixed_d", "solvent")
+            }
     frames = 0
-    start = int(trajectory_settings.get("start", 0))
-    stop_value = trajectory_settings.get("stop")
-    stop = None if stop_value is None else int(stop_value)
-    stride = int(trajectory_settings.get("stride", 1))
-    if start < 0 or (stop is not None and stop <= start) or stride < 1:
-        raise ValueError("invalid trajectory start/stop/stride")
     for timestep in universe.trajectory[start:stop:stride]:
         frames += 1
         box = valid_box(timestep.dimensions)
         for occurrence in occurrences:
+            if decomposition_payload is not None:
+                atom_positions = np.asarray(universe.atoms[occurrence].positions, dtype=float)
+                probe = float(config["decomposition"]["lcpo"]["probe_radius_A"])
+                atom_areas, atom_isolated = lcpo_areas(
+                    atom_positions, lcpo_assignments, box, probe
+                )
+                hybrid_fractions = aggregate_hybrid_accessible_fractions(
+                    atom_areas,
+                    atom_isolated,
+                    mapping.bead_order,
+                    mapping.bead_atoms,
+                    mapping.atom_beads,
+                )
+                centers = virtual_center_positions(
+                    atom_positions,
+                    mapping.bead_order,
+                    mapping.bead_atoms,
+                    decomposition_payload["mapping"]["bead_weights"],
+                    box,
+                )
+                cg_assignments = [
+                    decomposition_payload["lcpo"]["cg"][bead]
+                    for bead in mapping.bead_order
+                ]
+                cg_areas, cg_isolated = lcpo_areas(
+                    centers, cg_assignments, box, probe
+                )
+                for bead_index, bead in enumerate(mapping.bead_order):
+                    cg_fraction = (
+                        0.0
+                        if cg_isolated[bead_index] <= 0.0
+                        else cg_areas[bead_index] / cg_isolated[bead_index]
+                    )
+                    exposure_samples[bead]["hybrid"].append(hybrid_fractions[bead])
+                    exposure_samples[bead]["cg"].append(float(cg_fraction))
             for bead in mapping.bead_order:
                 local = np.asarray(mapping.bead_atoms[bead], dtype=int) - 1
                 positions = universe.atoms[occurrence[local]].positions
@@ -784,6 +1116,39 @@ def calculate_molecule(
                     sums[method][bead] += debye_amplitude(
                         positions, q, factors[method][bead], box
                     )
+                if "saxs" in decomposed_sums:
+                    components = component_factors["saxs"][bead]
+                    terms = debye_component_terms(
+                        positions,
+                        q,
+                        components["atomic"],
+                        components["solvent"],
+                        box,
+                    )
+                    for term, values in terms.items():
+                        decomposed_sums["saxs"][term][bead] += values
+                if "sans" in decomposed_sums:
+                    components_h = component_factors["sans_h"][bead]
+                    components_d = component_factors["sans_d"][bead]
+                    terms_h = debye_component_terms(
+                        positions,
+                        q,
+                        components_h["atomic"],
+                        components_h["solvent"],
+                        box,
+                    )
+                    terms_d = debye_component_terms(
+                        positions,
+                        q,
+                        components_d["atomic"],
+                        components_d["solvent"],
+                        box,
+                    )
+                    decomposed_sums["sans"]["atomic_h"][bead] += terms_h["atomic"]
+                    decomposed_sums["sans"]["mixed_h"][bead] += terms_h["mixed"]
+                    decomposed_sums["sans"]["atomic_d"][bead] += terms_d["atomic"]
+                    decomposed_sums["sans"]["mixed_d"][bead] += terms_d["mixed"]
+                    decomposed_sums["sans"]["solvent"][bead] += terms_h["solvent"]
     if frames == 0:
         raise ValueError(f"{name}: no trajectory frames were sampled")
     sample_count = frames * len(occurrences)
@@ -843,6 +1208,95 @@ def calculate_molecule(
             "crossovers": crossovers,
         }
 
+    if decomposition_payload is not None:
+        decomposition_payload["q"] = {
+            "minimum_A^-1": float(q[0]),
+            "maximum_A^-1": float(q[-1]),
+            "step_A^-1": float(q[1] - q[0]),
+        }
+        cutoff = float(
+            config["decomposition"]["diagnostics"]["accessible_fraction_cutoff"]
+        )
+        if not 0.0 <= cutoff <= 1.0:
+            raise ValueError(
+                "decomposition.diagnostics.accessible_fraction_cutoff must be in [0, 1]"
+            )
+        hybrid_all = np.asarray(
+            [value for bead in mapping.bead_order for value in exposure_samples[bead]["hybrid"]]
+        )
+        cg_all = np.asarray(
+            [value for bead in mapping.bead_order for value in exposure_samples[bead]["cg"]]
+        )
+        hybrid_exposed = hybrid_all >= cutoff
+        cg_exposed = cg_all >= cutoff
+        correlation = (
+            float(np.corrcoef(hybrid_all, cg_all)[0, 1])
+            if hybrid_all.size > 1
+            and np.std(hybrid_all) > np.finfo(float).eps
+            and np.std(cg_all) > np.finfo(float).eps
+            else None
+        )
+        per_bead_exposure = {
+            bead: {
+                "hybrid_mean_fraction": float(np.mean(exposure_samples[bead]["hybrid"])),
+                "cg_mean_fraction": float(np.mean(exposure_samples[bead]["cg"])),
+                "mean_absolute_difference": float(
+                    np.mean(
+                        np.abs(
+                            np.asarray(exposure_samples[bead]["hybrid"])
+                            - np.asarray(exposure_samples[bead]["cg"])
+                        )
+                    )
+                ),
+            }
+            for bead in mapping.bead_order
+        }
+        decomposition_payload["lcpo"]["exposure_comparison"] = {
+            "accessible_fraction_cutoff": cutoff,
+            "exposed_when": "accessible_fraction >= cutoff",
+            "sample_count": int(hybrid_all.size),
+            "pearson_correlation": correlation,
+            "mismatch_fraction": float(np.mean(hybrid_exposed != cg_exposed)),
+            "confusion_matrix": {
+                "both_exposed": int(np.sum(hybrid_exposed & cg_exposed)),
+                "hybrid_only": int(np.sum(hybrid_exposed & ~cg_exposed)),
+                "cg_only": int(np.sum(~hybrid_exposed & cg_exposed)),
+                "both_buried": int(np.sum(~hybrid_exposed & ~cg_exposed)),
+            },
+            "per_bead": per_bead_exposure,
+            "largest_mean_mismatches": sorted(
+                per_bead_exposure,
+                key=lambda bead: per_bead_exposure[bead]["mean_absolute_difference"],
+                reverse=True,
+            )[:10],
+        }
+        decomposition_payload["exposure_samples"] = exposure_samples
+        for method, term_sums in decomposed_sums.items():
+            fitted = _fit_decomposed_terms(
+                term_sums, sample_count, groups, q, config["fit"]
+            )
+            if method == "saxs":
+                densities = {
+                    bead: density_overrides.get(bead, density_default)
+                    for bead in mapping.bead_order
+                }
+            else:
+                # The legacy SANS custom-parameter path has no displaced-solvent
+                # contrast, so rho=0 is the exact reconstruction reference.
+                densities = {bead: 0.0 for bead in mapping.bead_order}
+            _decomposition_reconstruction_diagnostics(
+                method,
+                fitted,
+                method_results[method]["bead_curves"],
+                groups,
+                densities,
+            )
+            fitted["reference_density"] = densities
+            fitted["reference_sign_crossovers_A^-1"] = copy.deepcopy(
+                method_results[method]["crossovers"]
+            )
+            decomposition_payload["methods"][method] = fitted
+
     provenance = {
         "topology": {"path": str(topology), "sha256": _file_sha256(topology)},
         "trajectory": {
@@ -869,6 +1323,7 @@ def calculate_molecule(
         sans_one_parameter=sans_one,
         warnings=run_warnings,
         provenance=provenance,
+        decomposition=decomposition_payload,
     )
 
 
@@ -893,6 +1348,193 @@ def _write_text(path: Path, text: str, force: bool) -> None:
 
 def _render_coefficients(values: Iterable[float]) -> str:
     return ",".join(f"{float(value):.16g}" for value in values)
+
+
+def _contextual_parameter_text(
+    result: MoleculeResult,
+    method: str,
+    term: str,
+) -> str:
+    if result.decomposition is None:
+        raise ValueError("decomposed parameters were not calculated")
+    q_meta = result.decomposition["q"]
+    term_data = result.decomposition["methods"][method]["terms"][term.lower()]
+    rows = [term_data["bead_coefficients"][bead] for bead in result.bead_order]
+    return _contextual_parameter_rows_text(method, term, q_meta, rows)
+
+
+def _contextual_parameter_rows_text(
+    method: str,
+    term: str,
+    q_meta: Mapping[str, float],
+    rows: Iterable[Iterable[float]],
+) -> str:
+    lines = [
+        "FORMAT_VERSION=1",
+        f"METHOD={method.upper()}",
+        f"TERM={term.upper()}",
+        f"Q_MIN={q_meta['minimum_A^-1']:.16g}",
+        f"Q_MAX={q_meta['maximum_A^-1']:.16g}",
+        f"Q_STEP={q_meta['step_A^-1']:.16g}",
+    ]
+    for index, values in enumerate(rows, start=1):
+        lines.append(f"PARAMETERS{index}={_render_coefficients(values)}")
+    return "\n".join(lines) + "\n"
+
+
+def _lcpo_parameter_text(
+    assignments: Iterable[LCPOAssignment], representation: str
+) -> str:
+    lines = ["FORMAT_VERSION=1", f"REPRESENTATION={representation.upper()}"]
+    for index, assignment in enumerate(assignments, start=1):
+        lines.append(f"LCPO_PARAMETERS{index}={_render_coefficients(assignment.values)}")
+    return "\n".join(lines) + "\n"
+
+
+def _mapping_text(result: MoleculeResult) -> str:
+    if result.decomposition is None:
+        raise ValueError("decomposed mapping was not calculated")
+    mapping = result.decomposition["mapping"]
+    lines = ["FORMAT_VERSION=1"]
+    for index, bead in enumerate(result.bead_order, start=1):
+        atoms = ",".join(str(value) for value in mapping["bead_atoms"][bead])
+        weights = _render_coefficients(mapping["bead_weights"][bead])
+        lines.append(f"BEAD_ATOMS{index}={atoms}")
+        lines.append(f"BEAD_WEIGHTS{index}={weights}")
+    return "\n".join(lines) + "\n"
+
+
+def _inline_decomposition_text(result: MoleculeResult, method: str) -> str:
+    if result.decomposition is None:
+        raise ValueError("decomposed parameters were not calculated")
+    q_meta = result.decomposition["q"]
+    lines = [
+        f"# {result.name}: verbose {method.upper()} Equation-9 keywords",
+        f"PARAMETERS_Q_MIN={q_meta['minimum_A^-1']:.16g}",
+        f"PARAMETERS_Q_MAX={q_meta['maximum_A^-1']:.16g}",
+        f"PARAMETERS_Q_STEP={q_meta['step_A^-1']:.16g}",
+    ]
+    keywords = (
+        {
+            "atomic": "ATOMIC_PARAMETERS",
+            "solvent": "SOLVENT_PARAMETERS",
+            "mixed": "MIXED_PARAMETERS",
+        }
+        if method == "saxs"
+        else {
+            "atomic_h": "ATOMIC_PARAMETERS",
+            "mixed_h": "MIXED_PARAMETERS",
+            "solvent": "SOLVENT_PARAMETERS",
+            "atomic_d": "DEUTERATED_ATOMIC_PARAMETERS",
+            "mixed_d": "DEUTERATED_MIXED_PARAMETERS",
+        }
+    )
+    for term, keyword in keywords.items():
+        term_data = result.decomposition["methods"][method]["terms"][term]
+        for index, bead in enumerate(result.bead_order, start=1):
+            lines.append(
+                f"{keyword}{index}="
+                + _render_coefficients(term_data["bead_coefficients"][bead])
+            )
+    return "\n".join(lines) + "\n"
+
+
+def write_decomposition_outputs(
+    output: Path, result: MoleculeResult, force: bool
+) -> None:
+    """Write all version-1 Equation-9, mapping, LCPO, and diagnostic files."""
+    if result.decomposition is None:
+        return
+    prefix = output / result.name
+    file_terms: list[tuple[str, str, str]] = []
+    if "saxs" in result.decomposition["methods"]:
+        file_terms.extend(
+            ("saxs", term, f"{prefix}_saxs_{term}_parameters.inp")
+            for term in ("atomic", "solvent", "mixed")
+        )
+    if "sans" in result.decomposition["methods"]:
+        file_terms.extend(
+            [
+                ("sans", "atomic_h", f"{prefix}_sans_h_atomic_parameters.inp"),
+                ("sans", "mixed_h", f"{prefix}_sans_h_mixed_parameters.inp"),
+                ("sans", "atomic_d", f"{prefix}_sans_d_atomic_parameters.inp"),
+                ("sans", "mixed_d", f"{prefix}_sans_d_mixed_parameters.inp"),
+                ("sans", "solvent", f"{prefix}_sans_solvent_parameters.inp"),
+            ]
+        )
+    for method, term, filename in file_terms:
+        _write_text(
+            Path(filename),
+            _contextual_parameter_text(result, method, term),
+            force,
+        )
+    for method in result.decomposition["methods"]:
+        _write_text(
+            Path(f"{prefix}_{method}_equation9_inline.inp"),
+            _inline_decomposition_text(result, method),
+            force,
+        )
+
+    representations = result.decomposition["representations"]
+    if "hybrid" in representations:
+        _write_text(Path(f"{prefix}_hybrid_mapping.inp"), _mapping_text(result), force)
+        _write_text(
+            Path(f"{prefix}_hybrid_lcpo_parameters.inp"),
+            _lcpo_parameter_text(result.decomposition["lcpo"]["hybrid"], "hybrid"),
+            force,
+        )
+    if "cg" in representations:
+        assignments = [
+            result.decomposition["lcpo"]["cg"][bead] for bead in result.bead_order
+        ]
+        _write_text(
+            Path(f"{prefix}_cg_lcpo_parameters.inp"),
+            _lcpo_parameter_text(assignments, "cg"),
+            force,
+        )
+
+    eligible = result.decomposition["exchange"]["eligible_beads"]
+    eligible_indices = [
+        str(index)
+        for index, bead in enumerate(result.bead_order, start=1)
+        if eligible[bead]
+    ]
+    exchange_lines = [
+        "FORMAT_VERSION=1",
+        "EXCHANGEABLE_BEADS=" + ",".join(eligible_indices),
+    ]
+    _write_text(
+        Path(f"{prefix}_sans_exchangeable_beads.inp"),
+        "\n".join(exchange_lines) + "\n",
+        force,
+    )
+
+    diagnostics_path = Path(f"{prefix}_equation9_terms.csv")
+    if diagnostics_path.exists() and not force:
+        raise FileExistsError(diagnostics_path)
+    with diagnostics_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["method", "term", "group", "q_A^-1", "value", "fit", "residual"])
+        for method, method_data in result.decomposition["methods"].items():
+            for term, term_data in method_data["terms"].items():
+                for group, curve in term_data["group_curves"].items():
+                    fitted = np.polynomial.polynomial.polyval(
+                        result.q, term_data["coefficients"][group]
+                    )
+                    for q_value, value, fit_value in zip(
+                        result.q, curve, fitted, strict=True
+                    ):
+                        writer.writerow(
+                            [
+                                method,
+                                term,
+                                group,
+                                q_value,
+                                value,
+                                fit_value,
+                                fit_value - value,
+                            ]
+                        )
 
 
 def write_parameter_fragment(
@@ -991,7 +1633,164 @@ def plot_fits(
     plt.close(figure)
 
 
+def plot_decomposition_term_fits(
+    output: Path,
+    result: MoleculeResult,
+    low_q_max: float,
+    force: bool,
+) -> None:
+    """Plot every Equation-9 term and its exported polynomial reconstruction."""
+    if result.decomposition is None:
+        return
+    for method, method_data in result.decomposition["methods"].items():
+        for term, term_data in method_data["terms"].items():
+            path = output / f"{result.name}_{method}_{term}_fit.png"
+            figure, (top, bottom) = plt.subplots(
+                2,
+                1,
+                figsize=(8, 9),
+                sharex=True,
+                gridspec_kw={"height_ratios": (3, 1)},
+            )
+            for group, curve in term_data["group_curves"].items():
+                coefficients = term_data["coefficients"][group]
+                fitted = np.polynomial.polynomial.polyval(result.q, coefficients)
+                line = top.plot(result.q, curve, label=group)[0]
+                top.plot(
+                    result.q,
+                    fitted,
+                    "--",
+                    color=line.get_color(),
+                    alpha=0.85,
+                )
+                bottom.plot(
+                    result.q,
+                    fitted - curve,
+                    color=line.get_color(),
+                    label=group,
+                )
+            for axis in (top, bottom):
+                axis.axvspan(0.0, low_q_max, color="black", alpha=0.04)
+                axis.axhline(0.0, color="black", linestyle=":", linewidth=0.8)
+            top.set_title(
+                f"{result.name} {method.upper()} Equation 9: "
+                f"{term.replace('_', ' ')}"
+            )
+            top.set_ylabel("Equation-9 term value")
+            group_legend = top.legend(ncols=2, fontsize=8)
+            bottom.set_xlabel(r"$q$ ($\AA^{-1}$)")
+            bottom.set_ylabel("fit - value")
+            style_handles = [
+                Line2D([], [], color="0.25", linestyle="-", label="raw term"),
+                Line2D([], [], color="0.25", linestyle="--", label="polynomial fit"),
+            ]
+            top.add_artist(group_legend)
+            top.legend(handles=style_handles, loc="lower left")
+            figure.tight_layout()
+            if path.exists() and not force:
+                plt.close(figure)
+                raise FileExistsError(path)
+            figure.savefig(path, dpi=180)
+            plt.close(figure)
+
+
+def write_exposure_samples(path: Path, result: MoleculeResult, force: bool) -> None:
+    """Write every hybrid/native-CG LCPO fraction pair used by the diagnostics."""
+    if result.decomposition is None:
+        return
+    samples = result.decomposition.get("exposure_samples")
+    if not samples:
+        return
+    if path.exists() and not force:
+        raise FileExistsError(path)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sample", "bead", "hybrid_fraction", "cg_fraction"])
+        for bead in result.bead_order:
+            hybrid = samples[bead]["hybrid"]
+            cg = samples[bead]["cg"]
+            for sample, (hybrid_value, cg_value) in enumerate(
+                zip(hybrid, cg, strict=True)
+            ):
+                writer.writerow([sample, bead, hybrid_value, cg_value])
+
+
+def plot_exposure_correlation(path: Path, result: MoleculeResult, force: bool) -> None:
+    """Plot all LCPO fraction pairs and the bead-wise means against identity."""
+    if result.decomposition is None:
+        return
+    samples = result.decomposition.get("exposure_samples")
+    if not samples:
+        return
+    hybrid = np.concatenate(
+        [np.asarray(samples[bead]["hybrid"], dtype=float) for bead in result.bead_order]
+    )
+    cg = np.concatenate(
+        [np.asarray(samples[bead]["cg"], dtype=float) for bead in result.bead_order]
+    )
+    comparison = result.decomposition["lcpo"]["exposure_comparison"]
+    cutoff = float(comparison["accessible_fraction_cutoff"])
+    correlation = comparison["pearson_correlation"]
+    mae = float(np.mean(np.abs(cg - hybrid)))
+    bias = float(np.mean(cg - hybrid))
+
+    figure, axis = plt.subplots(figsize=(7.2, 6.4))
+    axis.scatter(
+        hybrid,
+        cg,
+        s=13,
+        alpha=0.22,
+        edgecolors="none",
+        color="tab:blue",
+        label=f"bead/frame observations (n={hybrid.size})",
+    )
+    hybrid_means = np.asarray(
+        [np.mean(samples[bead]["hybrid"]) for bead in result.bead_order]
+    )
+    cg_means = np.asarray([np.mean(samples[bead]["cg"]) for bead in result.bead_order])
+    axis.scatter(
+        hybrid_means,
+        cg_means,
+        s=42,
+        marker="D",
+        color="tab:orange",
+        edgecolors="black",
+        linewidths=0.4,
+        label="bead means",
+        zorder=3,
+    )
+    axis.plot([0.0, 1.0], [0.0, 1.0], ":", color="0.3", label="perfect agreement")
+    axis.axvline(cutoff, linestyle="--", linewidth=0.9, color="0.55")
+    axis.axhline(cutoff, linestyle="--", linewidth=0.9, color="0.55")
+    axis.text(
+        0.03,
+        0.97,
+        f"Pearson r = {correlation:.4f}\nMAE = {mae:.4f}\nCG-hybrid bias = {bias:+.4f}",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+    axis.set(
+        xlim=(0.0, 1.0),
+        ylim=(0.0, 1.0),
+        xlabel="hybrid LCPO accessible fraction",
+        ylabel="native-CG LCPO accessible fraction",
+        title=f"{result.name}: hybrid versus native-CG exposure",
+    )
+    axis.set_aspect("equal", adjustable="box")
+    axis.legend(loc="lower right", fontsize=8)
+    figure.tight_layout()
+    if path.exists() and not force:
+        plt.close(figure)
+        raise FileExistsError(path)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
 def _plain(value: Any) -> Any:
+    if is_dataclass(value):
+        return _plain(asdict(value))
     if isinstance(value, np.ndarray):
         return [_plain(item) for item in value.tolist()]
     if isinstance(value, (np.floating, np.integer)):
@@ -1004,7 +1803,7 @@ def _plain(value: Any) -> Any:
 
 
 def result_report(result: MoleculeResult, config: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    report = {
         "name": result.name,
         "frames": result.frames,
         "molecule_occurrences": result.occurrences,
@@ -1024,9 +1823,41 @@ def result_report(result: MoleculeResult, config: Mapping[str, Any]) -> dict[str
         "warnings": result.warnings,
         "provenance": result.provenance,
     }
+    if result.decomposition is not None:
+        report["equation9_decomposition"] = {
+            "format_version": 1,
+            "representations": result.decomposition["representations"],
+            "q": result.decomposition["q"],
+            "mapping": result.decomposition["mapping"],
+            "lcpo": result.decomposition["lcpo"],
+            "exchange": result.decomposition["exchange"],
+            "methods": {
+                method: {
+                    "terms": {
+                        term: {
+                            "coefficients_c0_first": data["coefficients"],
+                            "metrics": data["metrics"],
+                        }
+                        for term, data in method_data["terms"].items()
+                    },
+                    "reference_density": method_data["reference_density"],
+                    "reference_reconstruction": method_data["reconstruction"],
+                    "reference_sign_crossovers_A^-1": method_data[
+                        "reference_sign_crossovers_A^-1"
+                    ],
+                }
+                for method, method_data in result.decomposition["methods"].items()
+            },
+        }
+    return report
 
 
-def write_result(output: Path, result: MoleculeResult, config: Mapping[str, Any], force: bool) -> None:
+def write_result(
+    output: Path,
+    result: MoleculeResult,
+    config: Mapping[str, Any],
+    force: bool,
+) -> None:
     prefix = output / result.name
     for method in result.methods:
         write_curves(Path(f"{prefix}_{method}_curves.csv"), result, method, force)
@@ -1044,6 +1875,7 @@ def write_result(output: Path, result: MoleculeResult, config: Mapping[str, Any]
             "sans_one_parameter",
             force,
         )
+    write_decomposition_outputs(output, result, force)
     plot_fits(
         Path(f"{prefix}_form_factor_fits.png"),
         result,
@@ -1051,6 +1883,17 @@ def write_result(output: Path, result: MoleculeResult, config: Mapping[str, Any]
         force,
         bool(config.get("plot", {}).get("show_positive_magnitude", True)),
     )
+    if result.decomposition is not None:
+        plot_decomposition_term_fits(
+            output,
+            result,
+            float(config["fit"]["low_q_max"]),
+            force,
+        )
+        write_exposure_samples(Path(f"{prefix}_lcpo_exposure_samples.csv"), result, force)
+        plot_exposure_correlation(
+            Path(f"{prefix}_lcpo_exposure_correlation.png"), result, force
+        )
     report = yaml.safe_dump(_plain(result_report(result, config)), sort_keys=False)
     _write_text(Path(f"{prefix}_report.yaml"), report, force)
 
@@ -1077,9 +1920,21 @@ def write_project_outputs(
                 f"# SANS one parameter: {result.name}_sans_scattering_lengths.inp",
             ]
         )
+        if result.decomposition is not None:
+            example.extend(
+                [
+                    f"# Equation-9 SAXS files: {result.name}_saxs_*_parameters.inp",
+                    f"# Equation-9 SANS files: {result.name}_sans_*_parameters.inp",
+                    f"# Hybrid mapping/LCPO: {result.name}_hybrid_*.inp",
+                    f"# Native-CG LCPO: {result.name}_cg_lcpo_parameters.inp",
+                    f"# Verbose keywords: {result.name}_*_equation9_inline.inp",
+                ]
+            )
     _write_text(output / "plumed_example.inp", "\n".join(example) + "\n", force)
 
-    if not any(int(molecule.get("count", 1)) != 1 for molecule in molecules):
+    if len(molecules) == 1 and not any(
+        int(molecule.get("count", 1)) != 1 for molecule in molecules
+    ):
         return
     modes = ["saxs_polynomial", "sans_polynomial", "sans_one_parameter"]
     by_name = {result.name: result for result in results}
@@ -1105,6 +1960,102 @@ def write_project_outputs(
                     index += 1
         _write_text(output / f"project_{mode}.inp", "\n".join(lines) + "\n", force)
 
+    if not config.get("decomposition", {}).get("enabled", False):
+        return
+    expanded: list[MoleculeResult] = []
+    for molecule in molecules:
+        result = by_name[str(molecule["name"])]
+        expanded.extend([result] * int(molecule.get("count", 1)))
+    if any(result.decomposition is None for result in expanded):
+        raise ValueError("all project molecules must provide Equation-9 decomposition data")
+    decompositions = [result.decomposition for result in expanded]
+    assert all(item is not None for item in decompositions)
+    first = decompositions[0]
+    assert first is not None
+    for item in decompositions[1:]:
+        assert item is not None
+        if item["q"] != first["q"]:
+            raise ValueError("project Equation-9 outputs require identical q grids")
+        if item["representations"] != first["representations"]:
+            raise ValueError("project molecules must export the same LCPO representations")
+        if set(item["methods"]) != set(first["methods"]):
+            raise ValueError("project molecules must calculate the same scattering methods")
+
+    term_specs: list[tuple[str, str, str]] = []
+    if "saxs" in first["methods"]:
+        term_specs.extend(
+            ("saxs", term, f"project_saxs_{term}_parameters.inp")
+            for term in ("atomic", "solvent", "mixed")
+        )
+    if "sans" in first["methods"]:
+        term_specs.extend(
+            [
+                ("sans", "atomic_h", "project_sans_h_atomic_parameters.inp"),
+                ("sans", "mixed_h", "project_sans_h_mixed_parameters.inp"),
+                ("sans", "atomic_d", "project_sans_d_atomic_parameters.inp"),
+                ("sans", "mixed_d", "project_sans_d_mixed_parameters.inp"),
+                ("sans", "solvent", "project_sans_solvent_parameters.inp"),
+            ]
+        )
+    for method, term, filename in term_specs:
+        rows = [
+            result.decomposition["methods"][method]["terms"][term]["bead_coefficients"][bead]
+            for result in expanded
+            for bead in result.bead_order
+            if result.decomposition is not None
+        ]
+        _write_text(
+            output / filename,
+            _contextual_parameter_rows_text(method, term, first["q"], rows),
+            force,
+        )
+
+    atom_offset = 0
+    bead_index = 1
+    mapping_lines = ["FORMAT_VERSION=1"]
+    hybrid_assignments: list[LCPOAssignment] = []
+    cg_assignments: list[LCPOAssignment] = []
+    exchangeable_beads: list[str] = []
+    for result in expanded:
+        assert result.decomposition is not None
+        mapping = result.decomposition["mapping"]
+        for bead in result.bead_order:
+            atoms = [atom_offset + int(value) for value in mapping["bead_atoms"][bead]]
+            mapping_lines.append(f"BEAD_ATOMS{bead_index}=" + ",".join(map(str, atoms)))
+            mapping_lines.append(
+                f"BEAD_WEIGHTS{bead_index}="
+                + _render_coefficients(mapping["bead_weights"][bead])
+            )
+            if result.decomposition["exchange"]["eligible_beads"][bead]:
+                exchangeable_beads.append(str(bead_index))
+            cg_assignments.append(result.decomposition["lcpo"]["cg"][bead])
+            bead_index += 1
+        hybrid_assignments.extend(result.decomposition["lcpo"]["hybrid"])
+        atom_offset += int(mapping["atom_count"])
+
+    if "hybrid" in first["representations"]:
+        _write_text(
+            output / "project_hybrid_mapping.inp",
+            "\n".join(mapping_lines) + "\n",
+            force,
+        )
+        _write_text(
+            output / "project_hybrid_lcpo_parameters.inp",
+            _lcpo_parameter_text(hybrid_assignments, "hybrid"),
+            force,
+        )
+    if "cg" in first["representations"]:
+        _write_text(
+            output / "project_cg_lcpo_parameters.inp",
+            _lcpo_parameter_text(cg_assignments, "cg"),
+            force,
+        )
+    _write_text(
+        output / "project_sans_exchangeable_beads.inp",
+        "FORMAT_VERSION=1\nEXCHANGEABLE_BEADS=" + ",".join(exchangeable_beads) + "\n",
+        force,
+    )
+
 
 def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     configured = config.get("molecules")
@@ -1128,7 +2079,7 @@ def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list
     names = [str(spec.get("name") or Path(str(spec["mapping"])).stem) for spec in specs]
     if len(names) != len(set(names)):
         raise ValueError("molecule names must be unique")
-    for spec, name in zip(specs, names):
+    for spec, name in zip(specs, names, strict=True):
         spec["name"] = name
         count = int(spec.get("count", 1))
         if count < 1:
@@ -1140,13 +2091,32 @@ def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", help="bonded atomistic topology")
-    parser.add_argument("--trajectory", help="atomistic trajectory; topology coordinates are used if omitted")
+    parser.add_argument(
+        "--trajectory",
+        help="atomistic trajectory; topology coordinates are used if omitted",
+    )
     parser.add_argument("--mapping", help="CGBuilder mapping")
     parser.add_argument("--name", help="output molecule name")
     parser.add_argument("--config", type=Path, help="YAML settings or project file")
     parser.add_argument("--output", type=Path, help="new output directory")
-    parser.add_argument("--force", action="store_true", help="allow replacement of named output files")
-    parser.add_argument("--dry-run", action="store_true", help="validate inputs and report bead groups without writing")
+    parser.add_argument(
+        "--force", action="store_true", help="allow replacement of named output files"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate inputs and report bead groups without writing",
+    )
+    parser.add_argument(
+        "--decompose",
+        action="store_true",
+        help="generate Equation-9 atomic, solvent, mixed, mapping, and LCPO files",
+    )
+    parser.add_argument(
+        "--representation",
+        choices=("hybrid", "cg", "both"),
+        help="LCPO representation(s) to export; implies --decompose",
+    )
     return parser
 
 
@@ -1155,6 +2125,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config, base = load_config(args.config)
+        if args.decompose or args.representation:
+            config["decomposition"]["enabled"] = True
+        if args.representation:
+            config["decomposition"]["representations"] = (
+                ["hybrid", "cg"]
+                if args.representation == "both"
+                else [args.representation]
+            )
         molecules = _molecule_specs(args, config)
         results = [calculate_molecule(molecule, config, base) for molecule in molecules]
         for result in results:
