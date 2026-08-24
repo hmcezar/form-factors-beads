@@ -30,6 +30,9 @@ where `A` is the atomic/self term, `S` the displaced-solvent term, `M` the mixed
 - SANS uses femtometres: `A [fm^2]`, `S [Å^6]`, `M [fm Å^3]`, and `rho [fm Å^-3]`.
 - LCPO tuples use the units of the existing PLUMED LCPO implementation: base radius in ångström, areas in square ångström, and the corresponding coefficient dimensions required by the LCPO expression. The fixed water probe is added by PLUMED and is `1.4 Å` (`0.14 nm`); it is not folded into the serialized base radius.
 - Mapping atom identifiers are global, one-based PLUMED atom serials.
+- Hybrid accessible fractions are aggregated as conserved accessible area over
+  conserved isolated area, splitting shared atoms equally. Mapping mass weights
+  locate virtual centers and are not applied a second time to physical areas.
 
 ### Contextual coefficient files
 

@@ -141,8 +141,9 @@ decomposition:
     element_overrides: {}
     # bead_overrides: replace a derived native-CG tuple by bead name.
     bead_overrides: {}
-    # probe_radius_A: water-probe radius used only for LCPO diagnostics. Output
-    # tuples contain base radii; PLUMED adds the same probe at run time.
+    # probe_radius_A: fixed by the version-1 PLUMED contract. Output tuples
+    # contain base radii and PLUMED adds this 1.4 A probe at run time; other
+    # values are rejected because the parameter files cannot encode them.
     probe_radius_A: 1.4
   diagnostics:
     # accessible_fraction_cutoff: diagnostic-only exposed/buried threshold used

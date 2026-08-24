@@ -40,6 +40,11 @@ term, q range, and q step before the contiguous `PARAMETERSn` rows. Project
 mode writes corresponding `project_*` files with globally offset mapping atom
 serials in the configured molecule/count order.
 
+Per-molecule hybrid mappings use the selected atoms' global, one-based topology
+serials. Expanded project mappings instead rebase each mapping template into
+the configured molecule/count order before applying global offsets; this keeps
+template analysis independent of the assembled-system atom numbering.
+
 Project configurations can also expand the fragments for a complete mixture in
 the requested molecule order.
 
@@ -172,7 +177,15 @@ For SAXS, `a` is in electrons, `s` in cubic ångström, and `rho` in
 SLD is in `fm Å^-3`. Coefficients are always constant-first and q is in
 `Å^-1`. The exact q=0 identities are enforced before fitting. The report
 compares reconstructed magnitudes with the legacy form-factor path and records
-term-specific fit errors and sign-crossing diagnostics.
+term-specific fit errors and sign-crossing diagnostics. Generation also
+evaluates the exported term polynomials together and rejects a materially
+negative Equation-9 radicand at the reference density.
+
+The version-1 term files reconstruct the non-negative Equation-9 magnitude.
+They do not serialize the separate sign convention used by the legacy signed
+form-factor fit. A run-time PLUMED sign/crossover model therefore remains an
+explicit interface decision in the PLUMED implementation plan rather than an
+implicit promise of these files.
 
 SANS export contains protiated and exchanged atomic/mixed end states plus one
 shared solvent term. Exchangeable hydrogens are detected from bonds as H bound
@@ -218,7 +231,13 @@ the mismatch fraction, and the largest bead discrepancies at
 `decomposition.diagnostics.accessible_fraction_cutoff` (default `0.2`). This
 cutoff is only a diagnostic threshold; it does not affect generated
 coefficients, radii, or form factors. Output radii are base radii in ångström;
-the fixed `1.4 Å` water probe is added by PLUMED.
+the fixed `1.4 Å` water probe is added by PLUMED. Version 1 rejects any other
+configured probe radius because the generated LCPO files do not carry it.
+
+Hybrid accessible fractions are the sum of atom-accessible areas divided by
+the sum of their isolated areas, with shared atoms divided equally among their
+mapped beads. Mapping mass weights are used only to place virtual centers;
+applying them again to physical areas would introduce an unrelated mass bias.
 
 Diagnostic plots draw the signed form factor as a solid line, its polynomial
 fit as a dashed line, and the original non-negative `sqrt(I(q))` magnitude as a

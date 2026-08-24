@@ -183,6 +183,13 @@ def derive_cg_lcpo_parameters(
 ) -> tuple[dict[str, LCPOAssignment], dict[str, Any]]:
     """Derive pragmatic bead LCPO tuples from displaced volumes and atom tuples."""
     probe = float(settings.get("probe_radius_A", 1.4))
+    if not math.isfinite(probe) or not math.isclose(
+        probe, 1.4, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ValueError(
+            "decomposition.lcpo.probe_radius_A must be 1.4 A to match the "
+            "version-1 PLUMED LCPO contract"
+        )
     bead_overrides = settings.get("bead_overrides", {})
     unknown = set(bead_overrides) - set(bead_order)
     if unknown:
@@ -200,7 +207,7 @@ def derive_cg_lcpo_parameters(
         area_weight = 0.0
         for atom in bead_atoms[bead]:
             fraction = 1.0 / len(atom_memberships[atom])
-            element = elements[atom - 1]
+            element = "H" if elements[atom - 1] in {"D", "T"} else elements[atom - 1]
             if element not in atomic_volumes:
                 raise ValueError(f"No displaced volume for LCPO bead atom element {element}")
             volume += fraction * float(atomic_volumes[element])
@@ -343,6 +350,8 @@ def parse_contextual_parameter_file(path: str | Path) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise ValueError(f"{path}: invalid q metadata") from exc
+    if not np.all(np.isfinite([q_min, q_max, q_step])):
+        raise ValueError(f"{path}: q metadata must be finite")
     if q_min < 0.0 or q_max < q_min or q_step <= 0.0:
         raise ValueError(f"{path}: invalid q range")
     if not rows or sorted(rows) != list(range(1, len(rows) + 1)):
@@ -457,7 +466,11 @@ def aggregate_hybrid_accessible_fractions(
     bead_atoms: Mapping[str, Sequence[int]],
     atom_memberships: Mapping[int, Sequence[str]],
 ) -> dict[str, float]:
-    """Aggregate atom LCPO areas to beads, splitting shared atoms equally."""
+    """Aggregate atom LCPO areas by area, splitting shared atoms equally.
+
+    Mapping mass weights define virtual-center coordinates; they are not
+    additional statistical weights on physical accessible and isolated areas.
+    """
     fractions: dict[str, float] = {}
     for bead in bead_order:
         numerator = 0.0

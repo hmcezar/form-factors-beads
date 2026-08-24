@@ -44,6 +44,21 @@ END
     return path
 
 
+def write_prefixed_bonded_pdb(path: Path) -> Path:
+    path.write_text(
+        """ATOM      1  C0  DUM A   1      10.000   0.000   0.000  1.00  0.00           C
+ATOM      2  C1  MOL A   2       0.000   0.000   0.000  1.00  0.00           C
+ATOM      3  H1  MOL A   2       1.090   0.000   0.000  1.00  0.00           H
+ATOM      4  O1  MOL A   2      -1.230   0.000   0.000  1.00  0.00           O
+CONECT    2    3    4
+CONECT    3    2
+CONECT    4    2
+END
+"""
+    )
+    return path
+
+
 def test_cgbuilder_mapping_supports_shared_atoms_and_comments(tmp_path):
     mapping = ff.read_cgbuilder_mapping(write_mapping(tmp_path / "shared.map"))
     assert mapping.bead_order == ("B0", "B1")
@@ -108,6 +123,33 @@ def test_equation9_radicand_clamps_roundoff_but_rejects_material_negatives():
     material = {**tiny, "mixed": np.array([2.0])}
     with pytest.raises(ValueError, match="radicand is negative"):
         ff.equation9_radicand(material, 1.0)
+
+
+def test_exported_equation9_polynomials_reject_negative_radicands():
+    q = np.array([0.0, 1.0])
+    terms = {
+        "atomic": {
+            "bead_curves": {"B": np.ones(2)},
+            "bead_coefficients": {"B": np.array([1.0, -2.0])},
+        },
+        "solvent": {
+            "bead_curves": {"B": np.zeros(2)},
+            "bead_coefficients": {"B": np.zeros(2)},
+        },
+        "mixed": {
+            "bead_curves": {"B": np.zeros(2)},
+            "bead_coefficients": {"B": np.zeros(2)},
+        },
+    }
+    with pytest.raises(ValueError, match="exported polynomial.*radicand is negative"):
+        core._decomposition_reconstruction_diagnostics(
+            "saxs",
+            {"terms": terms},
+            {"B": np.ones(2)},
+            {"B": ["B"]},
+            {"B": 0.0},
+            q,
+        )
 
 
 def test_exchangeable_hydrogens_use_bonds_and_overrides():
@@ -206,6 +248,28 @@ def test_cg_radius_is_derived_from_shared_atom_adjusted_volume():
     assert details["B"]["volume_equivalent_radius_A"] == pytest.approx(expected_radius)
     assert details["B"]["split_displaced_volume_A3"] == pytest.approx(32.88)
 
+    with pytest.raises(ValueError, match="must be 1.4 A"):
+        ff.derive_cg_lcpo_parameters(*common, {"probe_radius_A": 1.5})
+
+
+def test_cg_volume_normalizes_hydrogen_isotopes():
+    carbon = ff.LCPOAssignment(
+        (1.7, 0.56482, -0.19608, -0.0010219, 0.0002658),
+        "test",
+        "C",
+    )
+    excluded_hydrogen = ff.LCPOAssignment((0.0, 0.0, 0.0, 0.0, 0.0), "test", "T")
+    _, details = ff.derive_cg_lcpo_parameters(
+        ["B"],
+        {"B": [1, 2]},
+        {1: ["B"], 2: ["B"]},
+        ["C", "T"],
+        {"C": 16.44, "H": 5.15},
+        [carbon, excluded_hydrogen],
+        {"probe_radius_A": 1.4},
+    )
+    assert details["B"]["split_displaced_volume_A3"] == pytest.approx(21.59)
+
 
 def test_contextual_parameter_parser_rejects_bad_contract(tmp_path):
     path = tmp_path / "bad.inp"
@@ -220,6 +284,12 @@ def test_contextual_parameter_parser_rejects_bad_contract(tmp_path):
         "Q_MIN=0\nQ_MAX=0.2\nQ_STEP=0.1\nPARAMETERS2=1\n"
     )
     with pytest.raises(ValueError, match="contiguous"):
+        ff.parse_contextual_parameter_file(path)
+    path.write_text(
+        "FORMAT_VERSION=1\nMETHOD=SAXS\nTERM=ATOMIC\n"
+        "Q_MIN=nan\nQ_MAX=0.2\nQ_STEP=0.1\nPARAMETERS1=1\n"
+    )
+    with pytest.raises(ValueError, match="q metadata must be finite"):
         ff.parse_contextual_parameter_file(path)
 
 
@@ -344,6 +414,36 @@ def test_saxs_contrast_splits_otherwise_identical_graphs():
         identity,
     )
     assert list(split.values()) == [["B0"], ["B1"]]
+
+
+def test_exchanged_isotopes_split_otherwise_identical_beads():
+    mapping = ff.MappingData(
+        bead_order=("B0", "B1"),
+        bead_atoms={"B0": (1, 2), "B1": (3, 4)},
+        atom_names={1: "O1", 2: "H1", 3: "O2", 4: "H2"},
+        atom_beads={1: ("B0",), 2: ("B0",), 3: ("B1",), 4: ("B1",)},
+        atom_count=4,
+    )
+    common = {
+        "solvent_electron_density": 0.334,
+        "electron_density_overrides": {},
+    }
+    groups = ff.group_equivalent_beads(
+        mapping,
+        ["O", "H", "O", "H"],
+        ["O", "D", "O", "H"],
+        {(1, 2): "1", (3, 4): "1"},
+        common,
+        {"force_groups": {}, "force_split": []},
+    )
+    assert list(groups.values()) == [["B0"], ["B1"]]
+
+    with pytest.raises(ValueError, match="inconsistent exchangeable-hydrogen"):
+        core._validate_exchange_grouping(
+            {"forced": ["B0", "B1"]},
+            mapping,
+            (2,),
+        )
 
 
 def test_config_deep_merge_keeps_unspecified_defaults(tmp_path):
@@ -502,6 +602,59 @@ def test_minimal_equation9_decomposition_and_outputs(tmp_path):
     assert "BEAD_ATOMS3=4,5" in project_mapping
     project_hybrid = (project / "project_hybrid_lcpo_parameters.inp").read_text()
     assert project_hybrid.count("LCPO_PARAMETERS") == 6
+
+    # Expanded outputs follow effective molecule results, not only the global
+    # decomposition switch used to construct the project.
+    project_override = tmp_path / "project-override"
+    _prepare_output(project_override, force=False)
+    globally_disabled = copy.deepcopy(config)
+    globally_disabled["decomposition"]["enabled"] = False
+    core.write_project_outputs(
+        project_override,
+        [result],
+        [{"name": "mini", "count": 2}],
+        globally_disabled,
+        force=False,
+    )
+    assert (project_override / "project_saxs_atomic_parameters.inp").is_file()
+
+    result.decomposition["lcpo"]["exposure_comparison"]["pearson_correlation"] = None
+    undefined_plot = tmp_path / "undefined-correlation.png"
+    core.plot_exposure_correlation(undefined_plot, result, force=False)
+    assert undefined_plot.stat().st_size > 0
+
+
+def test_hybrid_mapping_uses_global_serials_and_project_offsets(tmp_path):
+    topology = write_prefixed_bonded_pdb(tmp_path / "prefixed.pdb")
+    mapping = write_mapping(tmp_path / "molecule.map")
+    config = copy.deepcopy(ff.DEFAULT_CONFIG)
+    config["trajectory"]["selection"] = "resid 2"
+    config["q"] = {"minimum": 0.0, "maximum": 0.2, "step": 0.02}
+    config["fit"]["degree"] = 3
+    config["decomposition"]["enabled"] = True
+    result = ff.calculate_molecule(
+        {"name": "offset", "topology": topology, "trajectory": None, "mapping": mapping},
+        config,
+        tmp_path,
+    )
+    assert result.decomposition is not None
+    assert result.decomposition["mapping"]["bead_atoms"]["B0"] == (2, 3)
+    molecule_mapping = core._mapping_text(result)
+    assert "BEAD_ATOMS1=2,3" in molecule_mapping
+    assert "BEAD_ATOMS2=2,4" in molecule_mapping
+
+    project = tmp_path / "offset-project"
+    _prepare_output(project, force=False)
+    core.write_project_outputs(
+        project,
+        [result],
+        [{"name": "offset", "count": 2}],
+        config,
+        force=False,
+    )
+    expanded = (project / "project_hybrid_mapping.inp").read_text()
+    assert "BEAD_ATOMS1=1,2" in expanded
+    assert "BEAD_ATOMS3=4,5" in expanded
 
 
 @pytest.mark.parametrize(

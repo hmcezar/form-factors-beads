@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Validate fitted Equation-9 radicands, global hybrid atom serials, fixed-probe
+  LCPO compatibility, exchange-aware bead identity, finite contextual q
+  metadata, isotope volumes, per-molecule project exports, and undefined
+  exposure correlations.
 - Add per-term Equation-9 fit and residual plots for every exported SAXS and
   SANS coefficient set.
 - Write the underlying hybrid/native-CG exposure pairs and an automatic LCPO

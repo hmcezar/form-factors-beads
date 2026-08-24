@@ -8,3 +8,5 @@ fit:
 decomposition:
   enabled: true
   representations: [hybrid, cg]
+  diagnostics:
+    accessible_fraction_cutoff: 0.85

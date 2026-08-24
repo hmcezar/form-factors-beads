@@ -562,6 +562,32 @@ def group_equivalent_beads(
     return ordered
 
 
+def _validate_exchange_grouping(
+    groups: Mapping[str, list[str]],
+    mapping: MappingData,
+    exchangeable_hydrogens: tuple[int, ...],
+) -> None:
+    """Reject forced groups whose members have distinct exchanged end states."""
+    exchanged = set(exchangeable_hydrogens)
+    signatures = {
+        bead: tuple(
+            sorted(
+                1.0 / len(mapping.atom_beads[index])
+                for index in mapping.bead_atoms[bead]
+                if index in exchanged
+            )
+        )
+        for bead in mapping.bead_order
+    }
+    for group, members in groups.items():
+        if len({signatures[bead] for bead in members}) > 1:
+            raise ValueError(
+                f"identity group {group} combines beads with inconsistent "
+                "exchangeable-hydrogen end states; split the group or revise "
+                "decomposition.exchange overrides"
+            )
+
+
 def xray_component_factors(
     labels: list[str],
     weights: np.ndarray,
@@ -769,8 +795,9 @@ def _decomposition_reconstruction_diagnostics(
     legacy_curves: Mapping[str, np.ndarray],
     groups: Mapping[str, list[str]],
     densities: Mapping[str, float],
+    q: np.ndarray,
 ) -> dict[str, Any]:
-    """Compare decomposed magnitudes with the legacy averaged amplitudes."""
+    """Validate raw and exported-polynomial Equation-9 reconstructions."""
     diagnostics: dict[str, Any] = {}
     terms = decomposition["terms"]
     for bead, legacy in legacy_curves.items():
@@ -785,12 +812,39 @@ def _decomposition_reconstruction_diagnostics(
                 "solvent": terms["solvent"]["bead_curves"][bead],
                 "mixed": terms["mixed_h"]["bead_curves"][bead],
             }
-        reconstructed = np.sqrt(equation9_radicand(selected, float(densities[bead])))
+        density = float(densities[bead])
+        reconstructed = np.sqrt(equation9_radicand(selected, density))
         difference = reconstructed - np.abs(legacy)
+        fitted_selected = {
+            name: np.polynomial.polynomial.polyval(
+                q,
+                terms[term_name]["bead_coefficients"][bead],
+            )
+            for name, term_name in (
+                (("atomic", "atomic"), ("solvent", "solvent"), ("mixed", "mixed"))
+                if method == "saxs"
+                else (
+                    ("atomic", "atomic_h"),
+                    ("solvent", "solvent"),
+                    ("mixed", "mixed_h"),
+                )
+            )
+        }
+        try:
+            fitted_reconstructed = np.sqrt(
+                equation9_radicand(fitted_selected, density)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{method.upper()} bead {bead} exported polynomial {exc}"
+            ) from exc
+        fitted_difference = fitted_reconstructed - np.abs(legacy)
         diagnostics[bead] = {
-            "reference_density": float(densities[bead]),
+            "reference_density": density,
             "rmse": float(np.sqrt(np.mean(difference**2))),
             "max_abs_error": float(np.max(np.abs(difference))),
+            "fitted_rmse": float(np.sqrt(np.mean(fitted_difference**2))),
+            "fitted_max_abs_error": float(np.max(np.abs(fitted_difference))),
         }
     decomposition["reconstruction"] = diagnostics
     decomposition["group_members"] = copy.deepcopy(dict(groups))
@@ -849,6 +903,10 @@ def calculate_molecule(
     selected_indices, occurrences = _selected_occurrences(
         universe, str(trajectory_settings["selection"]), mapping.atom_count
     )
+    template_global_atoms = {
+        local_index: int(global_index) + 1
+        for local_index, global_index in enumerate(occurrences[0], start=1)
+    }
     elements = resolve_elements(
         universe, selected_indices, mapping.atom_count, config.get("element_overrides", {})
     )
@@ -892,8 +950,7 @@ def calculate_molecule(
     exchanged_isotopes = list(isotopes)
     lcpo_assignments: list[LCPOAssignment] = []
     if decomposition_enabled:
-        # The isolated-SASA radius model is defined on the first frame included
-        # by the configured trajectory slice, not necessarily trajectory frame 0.
+        # Initialize geometry from the first frame included by the configured slice.
         universe.trajectory[start]
         decomposition_settings = config["decomposition"]
         representations = [
@@ -939,6 +996,17 @@ def calculate_molecule(
         )
         for atom_index in exchangeable_hydrogens:
             exchanged_isotopes[atom_index - 1] = "D"
+        # Exchange overrides are part of the decomposed SANS identity. Rebuild
+        # automatic groups so distinct H/D end states are never averaged.
+        groups = group_equivalent_beads(
+            mapping,
+            elements,
+            exchanged_isotopes,
+            bonds,
+            config["saxs"],
+            config["identity"],
+        )
+        _validate_exchange_grouping(groups, mapping, exchangeable_hydrogens)
         try:
             template_masses = np.asarray(template_atoms.masses, dtype=float)
         except NoDataError:
@@ -964,9 +1032,16 @@ def calculate_molecule(
             "representations": representations,
             "mapping": {
                 "atom_count": mapping.atom_count,
-                "bead_atoms": copy.deepcopy(dict(mapping.bead_atoms)),
+                "bead_atoms": {
+                    bead: tuple(
+                        template_global_atoms[index]
+                        for index in mapping.bead_atoms[bead]
+                    )
+                    for bead in mapping.bead_order
+                },
+                "template_bead_atoms": copy.deepcopy(dict(mapping.bead_atoms)),
                 "bead_weights": mapping_weights,
-                "index_convention": "one-based template serials",
+                "index_convention": "global one-based topology atom serials",
             },
             "lcpo": {
                 "hybrid": lcpo_assignments,
@@ -1290,6 +1365,7 @@ def calculate_molecule(
                 method_results[method]["bead_curves"],
                 groups,
                 densities,
+                q,
             )
             fitted["reference_density"] = densities
             fitted["reference_sign_crossovers_A^-1"] = copy.deepcopy(
@@ -1762,10 +1838,11 @@ def plot_exposure_correlation(path: Path, result: MoleculeResult, force: bool) -
     axis.plot([0.0, 1.0], [0.0, 1.0], ":", color="0.3", label="perfect agreement")
     axis.axvline(cutoff, linestyle="--", linewidth=0.9, color="0.55")
     axis.axhline(cutoff, linestyle="--", linewidth=0.9, color="0.55")
+    correlation_text = "undefined" if correlation is None else f"{correlation:.4f}"
     axis.text(
         0.03,
         0.97,
-        f"Pearson r = {correlation:.4f}\nMAE = {mae:.4f}\nCG-hybrid bias = {bias:+.4f}",
+        f"Pearson r = {correlation_text}\nMAE = {mae:.4f}\nCG-hybrid bias = {bias:+.4f}",
         transform=axis.transAxes,
         ha="left",
         va="top",
@@ -1960,12 +2037,12 @@ def write_project_outputs(
                     index += 1
         _write_text(output / f"project_{mode}.inp", "\n".join(lines) + "\n", force)
 
-    if not config.get("decomposition", {}).get("enabled", False):
-        return
     expanded: list[MoleculeResult] = []
     for molecule in molecules:
         result = by_name[str(molecule["name"])]
         expanded.extend([result] * int(molecule.get("count", 1)))
+    if all(result.decomposition is None for result in expanded):
+        return
     if any(result.decomposition is None for result in expanded):
         raise ValueError("all project molecules must provide Equation-9 decomposition data")
     decompositions = [result.decomposition for result in expanded]
@@ -2019,8 +2096,9 @@ def write_project_outputs(
     for result in expanded:
         assert result.decomposition is not None
         mapping = result.decomposition["mapping"]
+        template_bead_atoms = mapping.get("template_bead_atoms", mapping["bead_atoms"])
         for bead in result.bead_order:
-            atoms = [atom_offset + int(value) for value in mapping["bead_atoms"][bead]]
+            atoms = [atom_offset + int(value) for value in template_bead_atoms[bead]]
             mapping_lines.append(f"BEAD_ATOMS{bead_index}=" + ",".join(map(str, atoms)))
             mapping_lines.append(
                 f"BEAD_WEIGHTS{bead_index}="

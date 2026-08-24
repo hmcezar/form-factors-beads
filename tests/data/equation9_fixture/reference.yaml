@@ -4,13 +4,13 @@ expected:
   exchangeable_hydrogens: [2]
   exchangeable_beads: [B0]
   exposure_comparison:
-    accessible_fraction_cutoff: 0.2
-    mismatch_fraction: 0.0
+    accessible_fraction_cutoff: 0.85
+    mismatch_fraction: 0.5
     confusion_matrix:
-      both_exposed: 2
+      both_exposed: 0
       hybrid_only: 0
-      cg_only: 0
-      both_buried: 0
+      cg_only: 1
+      both_buried: 1
     per_bead:
       B0:
         hybrid_mean_fraction: 0.7993669540718161

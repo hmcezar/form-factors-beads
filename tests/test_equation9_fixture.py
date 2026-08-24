@@ -111,6 +111,9 @@ def test_equation9_cross_repository_fixture(tmp_path):
         if eligible
     ] == reference["exchangeable_beads"]
     comparison = result.decomposition["lcpo"]["exposure_comparison"]
+    assert comparison["accessible_fraction_cutoff"] == pytest.approx(
+        reference["exposure_comparison"]["accessible_fraction_cutoff"]
+    )
     assert comparison["mismatch_fraction"] == pytest.approx(
         reference["exposure_comparison"]["mismatch_fraction"]
     )
