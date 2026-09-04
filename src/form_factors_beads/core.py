@@ -166,12 +166,20 @@ def _parse_ndx(path: str | Path) -> list[tuple[str, list[int]]]:
                 continue
             if name is None:
                 raise ValueError(f"{path}: data before the first [ group ] header")
-            try:
-                groups[-1][1].extend(int(token) for token in line.split())
-            except ValueError as exc:
-                raise ValueError(
-                    f"{path}: invalid atom index on line {line_number}"
-                ) from exc
+            indices: list[int] = []
+            for token in line.split():
+                try:
+                    index = int(token)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path}: invalid atom index on line {line_number}"
+                    ) from exc
+                if index < 1:
+                    raise ValueError(f"{path}: invalid atom index {index}")
+                if index in indices:
+                    raise ValueError(f"{path}: repeated atom index {index}")
+                indices.append(index)
+            groups[-1][1].extend(indices)
     if not groups:
         raise ValueError(f"{path}: no [ group ] sections found")
     empty = [group_name for group_name, atoms in groups if not atoms]
@@ -246,6 +254,7 @@ def read_cgbuilder_mapping(
     atom_beads: dict[int, tuple[str, ...]]
     atom_topology: tuple[int, ...] | None
 
+    row_indices: set[int] = set()
     for row in sections["atoms"]:
         if len(row) < 3:
             raise ValueError(f"{path}: malformed [ atoms ] row: {' '.join(row)}")
@@ -254,7 +263,10 @@ def read_cgbuilder_mapping(
         except ValueError as exc:
             raise ValueError(f"{path}: invalid atom index {row[0]!r}") from exc
         if index < 1:
-            raise ValueError(f"{path}: duplicate or invalid atom index {index}")
+            raise ValueError(f"{path}: invalid atom index {index}")
+        if index in row_indices:
+            raise ValueError(f"{path}: duplicate atom index {index}")
+        row_indices.add(index)
         unknown = [bead for bead in row[2:] if bead not in known_names]
         if unknown:
             raise ValueError(f"{path}: unknown bead(s) {unknown} for atom {index}")
@@ -752,7 +764,11 @@ def xray_factors(
 ) -> np.ndarray:
     factors = np.empty((q.size, len(labels)), dtype=float)
     missing = sorted(
-        {label for label in labels if base_element(label) not in volumes}
+        {
+            base_element(label)
+            for label in labels
+            if base_element(label) not in volumes
+        }
     )
     if missing:
         raise ValueError(

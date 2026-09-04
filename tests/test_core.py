@@ -138,6 +138,18 @@ def test_xray_factor_requires_a_displaced_volume():
         )
 
 
+def test_xray_missing_volume_reports_the_base_element():
+    with pytest.raises(ValueError, match="H; provide") as excinfo:
+        ff.xray_factors(
+            ["2H"],
+            np.ones(1),
+            np.array([0.0, 0.1]),
+            density=0.334,
+            volumes={"C": 16.44},
+        )
+    assert "2H" not in str(excinfo.value)
+
+
 def test_isotope_override_cannot_change_the_element():
     with pytest.raises(ValueError, match="changes atom 1 element"):
         core.isotope_labels(["C"], {1: "N-15"})
@@ -335,6 +347,37 @@ def test_index_memberships_must_agree_with_the_mapping(tmp_path):
     index.write_text("[ B0 ]\n1 2 3\n\n[ B0 ]\n4 5\n")
     with pytest.raises(ValueError, match="disagree"):
         ff.read_cgbuilder_mapping(mapping, index)
+
+
+@pytest.mark.parametrize(
+    "content, message",
+    [
+        ("[ B0 ]\n1 2 3\n\n[ B0 ]\n0 5 6\n", "invalid atom index 0"),
+        ("[ B0 ]\n1 2 3\n\n[ B0 ]\n4 5 5\n", "repeated atom index 5"),
+    ],
+)
+def test_index_rejects_invalid_or_repeated_atoms(tmp_path, content, message):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = tmp_path / "bad.ndx"
+    index.write_text(content)
+    with pytest.raises(ValueError, match=message):
+        ff.read_cgbuilder_mapping(mapping, index)
+
+
+def test_mapping_rejects_repeated_atom_rows(tmp_path):
+    text = """[ to ]
+martini
+
+[ martini ]
+B0 B1
+
+[ atoms ]
+1 C1 B0
+1 H1 B0
+2 O1 B1
+"""
+    with pytest.raises(ValueError, match="duplicate atom index 1"):
+        ff.read_cgbuilder_mapping(write_mapping(tmp_path / "dup.map", text))
 
 
 def test_index_template_must_match_the_first_occurrence(tmp_path):
