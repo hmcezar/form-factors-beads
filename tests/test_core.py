@@ -365,16 +365,19 @@ def test_index_rejects_invalid_or_repeated_atoms(tmp_path, content, message):
 
 
 def test_mapping_rejects_repeated_atom_rows(tmp_path):
+    # 'B0 B0' memberships are valid: an atom may be shared between two
+    # beads that share a name. The raised error must come from the
+    # repeated atom index (first column), not the memberships.
     text = """[ to ]
 martini
 
 [ martini ]
-B0 B1
+B0 B0
 
 [ atoms ]
-1 C1 B0
+1 C1 B0 B0
 1 H1 B0
-2 O1 B1
+2 O1 B0
 """
     with pytest.raises(ValueError, match="duplicate atom index 1"):
         ff.read_cgbuilder_mapping(write_mapping(tmp_path / "dup.map", text))
