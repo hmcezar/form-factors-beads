@@ -11,7 +11,6 @@ import yaml
 
 import form_factors_beads as ff
 
-
 DATA_DIR = Path(__file__).with_name("data")
 BEADS = tuple(f"B{i}" for i in range(15))
 

@@ -71,6 +71,27 @@ may be assigned to more than one bead. Its scattering amplitude is then split
 equally among those memberships, preserving the molecule-wide value of
 `F(0)`.
 
+### Repeated bead names and the index file
+
+`[ martini ]` bead names may repeat — for amino acids one residue mapping is
+typically reused for every residue, so `BB`, `SC1`, ... occur once per bead
+occurrence. Each occurrence is then a distinct bead internally, addressed as
+`NAME#k` (`SC1#3` is the third `SC1` in `[ martini ]` order). Because the
+`[ atoms ]` section alone cannot tell which occurrence a shared name refers
+to, an index (`.ndx`) file is required in that case:
+
+```bash
+form-factors-beads --mapping molecule.map --index molecule.ndx ...
+```
+
+The index groups must appear in `[ martini ]` order (one group per bead
+occurrence) and list the 1-based topology atom numbers of that occurrence;
+the index is authoritative for the atom-to-bead assignment. Settings keys
+that address beads (`electron_density_overrides`, `force_split`,
+`force_groups`, sign `crossovers`/`widths`) accept the plain name when it is
+unique and the positional `NAME#k` form otherwise. Output fragments keep one
+`PARAMETERSn`/`SCATLENn` line per `[ martini ]` entry, in that order.
+
 Beads are compared as labeled molecular graphs. Identity includes:
 
 - elements and SANS isotope labels;

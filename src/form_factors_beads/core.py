@@ -9,6 +9,7 @@ low-q weighted polynomial fit, and writes PLUMED parameter fragments.
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import csv
 import hashlib
@@ -18,26 +19,26 @@ import re
 import sys
 import warnings
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import MDAnalysis as mda
+import networkx as nx
+import numpy as np
+import periodictable as pt
+import yaml
+from matplotlib.lines import Line2D
 from MDAnalysis.exceptions import NoDataError
 from MDAnalysis.guesser.default_guesser import DefaultGuesser
 from MDAnalysis.lib.distances import distance_array
-import networkx as nx
 from networkx.algorithms import isomorphism
-import numpy as np
-import periodictable as pt
 from periodictable import cromermann
-import yaml
-
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 ATOMIC_VOLUME_FILE = PACKAGE_DIR / "data" / "atomic_volumes.yaml"
@@ -77,17 +78,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class MappingData:
+    # bead_order holds unique keys: the bead name when unique, otherwise a
+    # 1-based positional suffix (SC1#1, SC1#2, ...) following [ martini ] order.
     bead_order: tuple[str, ...]
     bead_atoms: Mapping[str, tuple[int, ...]]
     atom_names: Mapping[int, str]
     atom_beads: Mapping[int, tuple[str, ...]]
     atom_count: int
+    # Original bead names in [ martini ] order; may repeat.
+    bead_names: tuple[str, ...] = ()
+    # Global (1-based) topology index of each template atom when the mapping
+    # was resolved from an index (.ndx) file; None for map-only templates.
+    atom_topology: tuple[int, ...] | None = None
+    indexed: bool = False
 
 
 @dataclass
 class MoleculeResult:
     name: str
     bead_order: list[str]
+    bead_names: list[str]
     groups: OrderedDict[str, list[str]]
     frames: int
     occurrences: int
@@ -125,12 +135,101 @@ def _strip_comment(line: str) -> str:
     return re.split(r"[;#]", line, maxsplit=1)[0].strip()
 
 
-def read_cgbuilder_mapping(path: str | Path) -> MappingData:
-    """Read a CGBuilder map, including atoms shared by multiple beads."""
+def _unique_bead_keys(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Give every bead a unique key: its name, or NAME#k for repeated names."""
+    counts = collections.Counter(names)
+    duplicated = {name for name, count in counts.items() if count > 1}
+    seen: collections.Counter[str] = collections.Counter()
+    keys: list[str] = []
+    for name in names:
+        if name in duplicated:
+            seen[name] += 1
+            keys.append(f"{name}#{seen[name]}")
+        else:
+            keys.append(name)
+    return tuple(keys)
+
+
+def _parse_ndx(path: str | Path) -> list[tuple[str, list[int]]]:
+    """Read an index file: ordered [ name ] groups of 1-based atom numbers."""
+    groups: list[tuple[str, list[int]]] = []
+    name: str | None = None
+    with Path(path).open() as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            line = _strip_comment(raw)
+            if not line:
+                continue
+            match = re.fullmatch(r"\[\s*([^]]+?)\s*\]", line)
+            if match:
+                name = match.group(1).strip()
+                groups.append((name, []))
+                continue
+            if name is None:
+                raise ValueError(f"{path}: data before the first [ group ] header")
+            indices: list[int] = []
+            for token in line.split():
+                try:
+                    index = int(token)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path}: invalid atom index on line {line_number}"
+                    ) from exc
+                if index < 1:
+                    raise ValueError(f"{path}: invalid atom index {index}")
+                if index in indices:
+                    raise ValueError(f"{path}: repeated atom index {index}")
+                indices.append(index)
+            groups[-1][1].extend(indices)
+    if not groups:
+        raise ValueError(f"{path}: no [ group ] sections found")
+    empty = [group_name for group_name, atoms in groups if not atoms]
+    if empty:
+        raise ValueError(f"{path}: empty groups: {', '.join(empty)}")
+    return groups
+
+
+def resolve_bead_key(mapping: MappingData, value: Any) -> str:
+    """Resolve a user-facing bead key (name or NAME#k) to the unique key."""
+    key = str(value)
+    if key in mapping.bead_order:
+        return key
+    positional = [
+        unique
+        for name, unique in zip(mapping.bead_names, mapping.bead_order, strict=True)
+        if name == key
+    ]
+    if len(positional) == 1:
+        return positional[0]
+    if len(positional) > 1:
+        raise ValueError(
+            f"ambiguous bead name {key!r}; use the positional form such as "
+            f"{positional[0]} (valid beads: {', '.join(mapping.bead_order)})"
+        )
+    raise ValueError(f"unknown bead {key!r}; known beads: {', '.join(mapping.bead_order)}")
+
+
+def _resolve_bead_key_or_keep(mapping: MappingData, value: Any) -> str:
+    """Resolve a bead key, keeping the original for non-bead labels (group names)."""
+    try:
+        return resolve_bead_key(mapping, value)
+    except ValueError:
+        return str(value)
+
+
+def read_cgbuilder_mapping(
+    path: str | Path, index_path: str | Path | None = None
+) -> MappingData:
+    """Read a CGBuilder map, including atoms shared by multiple beads.
+
+    Bead names may repeat (one entry per residue in [ martini ]). When they do,
+    ``index_path`` must point to an index file whose [ group ] sections list,
+    in [ martini ] order, the 1-based topology atom numbers of every bead
+    occurrence; the index is authoritative for the atom-to-bead assignment.
+    """
     sections: dict[str, list[list[str]]] = {}
     section: str | None = None
     with Path(path).open() as handle:
-        for line_number, raw in enumerate(handle, start=1):
+        for _line_number, raw in enumerate(handle, start=1):
             line = _strip_comment(raw)
             if not line:
                 continue
@@ -144,13 +243,18 @@ def read_cgbuilder_mapping(path: str | Path) -> MappingData:
 
     if "martini" not in sections or "atoms" not in sections:
         raise ValueError(f"{path}: expected [ martini ] and [ atoms ] sections")
-    bead_order = tuple(token for row in sections["martini"] for token in row)
-    if not bead_order or len(bead_order) != len(set(bead_order)):
+    bead_names = tuple(token for row in sections["martini"] for token in row)
+    if not bead_names:
         raise ValueError(f"{path}: bead names must be present and unique")
+    bead_order = _unique_bead_keys(bead_names)
+    known_names = set(bead_names)
 
-    bead_atoms: dict[str, list[int]] = {bead: [] for bead in bead_order}
-    atom_names: dict[int, str] = {}
-    atom_beads: dict[int, tuple[str, ...]] = {}
+    bead_atoms: dict[str, list[int]]
+    atom_names: dict[int, str]
+    atom_beads: dict[int, tuple[str, ...]]
+    atom_topology: tuple[int, ...] | None
+
+    row_indices: set[int] = set()
     for row in sections["atoms"]:
         if len(row) < 3:
             raise ValueError(f"{path}: malformed [ atoms ] row: {' '.join(row)}")
@@ -158,29 +262,95 @@ def read_cgbuilder_mapping(path: str | Path) -> MappingData:
             index = int(row[0])
         except ValueError as exc:
             raise ValueError(f"{path}: invalid atom index {row[0]!r}") from exc
-        if index < 1 or index in atom_names:
-            raise ValueError(f"{path}: duplicate or invalid atom index {index}")
-        memberships = tuple(dict.fromkeys(row[2:]))
-        unknown = [bead for bead in memberships if bead not in bead_atoms]
+        if index < 1:
+            raise ValueError(f"{path}: invalid atom index {index}")
+        if index in row_indices:
+            raise ValueError(f"{path}: duplicate atom index {index}")
+        row_indices.add(index)
+        unknown = [bead for bead in row[2:] if bead not in known_names]
         if unknown:
             raise ValueError(f"{path}: unknown bead(s) {unknown} for atom {index}")
-        atom_names[index] = row[1]
-        atom_beads[index] = memberships
-        for bead in memberships:
-            bead_atoms[bead].append(index)
 
-    empty = [bead for bead, atoms in bead_atoms.items() if not atoms]
-    if empty:
-        raise ValueError(f"{path}: beads without atoms: {', '.join(empty)}")
-    indices = sorted(atom_names)
-    if indices != list(range(1, max(indices) + 1)):
-        raise ValueError(f"{path}: atom indices must be contiguous and 1-based")
+    if index_path is not None:
+        groups = _parse_ndx(index_path)
+        expected_names = list(bead_names)
+        actual_names = [group_name for group_name, _ in groups]
+        if actual_names != expected_names:
+            raise ValueError(
+                f"{index_path}: group names {actual_names} do not match the "
+                f"[ martini ] bead order {expected_names}"
+            )
+        union = sorted({atom for _, atoms in groups for atom in atoms})
+        rank = {atom: position + 1 for position, atom in enumerate(union)}
+        atom_topology = tuple(union)
+        bead_atoms = {
+            key: tuple(sorted(rank[atom] for atom in atoms))
+            for (_, atoms), key in zip(groups, bead_order, strict=True)
+        }
+        atom_beads = {}
+        for (_, atoms), key in zip(groups, bead_order, strict=True):
+            for atom in atoms:
+                atom_beads.setdefault(rank[atom], []).append(key)
+        atom_beads = {atom: tuple(keys) for atom, keys in atom_beads.items()}
+        counts = collections.Counter(
+            token for row in sections["atoms"] for token in row[2:]
+        )
+        group_sizes = collections.Counter()
+        for group_name, atoms in groups:
+            group_sizes[group_name] += len(atoms)
+        mismatched = [
+            name for name in known_names if counts.get(name, 0) != group_sizes[name]
+        ]
+        if mismatched:
+            raise ValueError(
+                f"{index_path}: atom memberships disagree with the mapping for "
+                f"{', '.join(sorted(mismatched))}; the [ atoms ] section must "
+                "carry one token per bead membership"
+            )
+        atom_names = {}
+    else:
+        duplicates = [
+            name for name, count in collections.Counter(bead_names).items() if count > 1
+        ]
+        if duplicates:
+            raise ValueError(
+                f"{path}: bead names must be present and unique unless an index "
+                f"file is supplied (duplicated: {', '.join(duplicates)})"
+            )
+        bead_atoms = {bead: [] for bead in bead_order}
+        atom_names = {}
+        atom_beads = {}
+        atom_topology = None
+        for row in sections["atoms"]:
+            index = int(row[0])
+            memberships = tuple(dict.fromkeys(row[2:]))
+            atom_names[index] = row[1]
+            atom_beads[index] = memberships
+            for bead in memberships:
+                bead_atoms[bead].append(index)
+
+    if index_path is None:
+        empty = [bead for bead, atoms in bead_atoms.items() if not atoms]
+        if empty:
+            raise ValueError(f"{path}: beads without atoms: {', '.join(empty)}")
+        indices = sorted(atom_names)
+        if indices != list(range(1, max(indices) + 1)):
+            raise ValueError(f"{path}: atom indices must be contiguous and 1-based")
+    else:
+        indices = sorted(atom_beads)
+        if indices != list(range(1, len(atom_beads) + 1)):
+            raise ValueError(
+                f"{index_path}: index atoms must be contiguous and 1-based"
+            )
     return MappingData(
         bead_order=bead_order,
         bead_atoms={key: tuple(value) for key, value in bead_atoms.items()},
         atom_names=atom_names,
         atom_beads=atom_beads,
         atom_count=max(indices),
+        bead_names=bead_names,
+        atom_topology=atom_topology,
+        indexed=index_path is not None,
     )
 
 
@@ -344,8 +514,12 @@ def _bond_table(
             raise ValueError(
                 "The topology has no bonds. Supply a bonded topology or explicitly "
                 "set trajectory.guess_bonds: true."
-            )
-        warnings.warn("Guessing bonds from the first trajectory frame", RuntimeWarning)
+            ) from None
+        warnings.warn(
+            "Guessing bonds from the first trajectory frame",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         universe.atoms.guess_bonds()
         bonds = universe.bonds
     reverse = {global_index: local + 1 for local, global_index in enumerate(occurrence)}
@@ -398,6 +572,54 @@ def _graphs_equal(left: nx.Graph, right: nx.Graph) -> bool:
         node_match=isomorphism.categorical_node_match("label", ""),
         edge_match=isomorphism.categorical_edge_match("order", "1"),
     )
+
+
+def _resolve_settings_bead_keys(config: Mapping[str, Any], mapping: MappingData) -> dict[str, Any]:
+    """Resolve user-facing bead keys in a config copy against a mapping.
+
+    Bead-keyed settings accept either the plain bead name (unique names only)
+    or the positional NAME#k form. ``group:`` density overrides are kept as-is
+    because their keys name automatic groups, which exist only after identity
+    grouping. Sign crossovers and widths may also name whole groups, so their
+    unresolvable keys are kept unchanged and ignored, as before.
+    """
+    resolved = copy.deepcopy(dict(config))
+    overrides = resolved.setdefault("saxs", {}).get("electron_density_overrides", {})
+    if isinstance(overrides, Mapping):
+        resolved["saxs"]["electron_density_overrides"] = {
+            **{
+                key: value
+                for key, value in overrides.items()
+                if str(key).startswith("group:")
+            },
+            **{
+                resolve_bead_key(mapping, key): value
+                for key, value in overrides.items()
+                if not str(key).startswith("group:")
+            },
+        }
+    identity = resolved.setdefault("identity", {})
+    force_split = identity.get("force_split", [])
+    if isinstance(force_split, list | tuple):
+        identity["force_split"] = [resolve_bead_key(mapping, item) for item in force_split]
+    force_groups = identity.get("force_groups", {})
+    if isinstance(force_groups, Mapping):
+        identity["force_groups"] = {
+            str(name): [resolve_bead_key(mapping, member) for member in members]
+            for name, members in force_groups.items()
+        }
+    for leaves in (
+        resolved.get("sign", {}).get("crossovers", {}),
+        resolved.get("sign", {}).get("widths", {}),
+    ):
+        if isinstance(leaves, Mapping):
+            for method, values in leaves.items():
+                if isinstance(values, Mapping):
+                    leaves[method] = {
+                        _resolve_bead_key_or_keep(mapping, key): value
+                        for key, value in values.items()
+                    }
+    return resolved
 
 
 def group_equivalent_beads(
@@ -541,7 +763,13 @@ def xray_factors(
     volumes: Mapping[str, float],
 ) -> np.ndarray:
     factors = np.empty((q.size, len(labels)), dtype=float)
-    missing = sorted({base_element(label) for label in labels if base_element(label) not in volumes})
+    missing = sorted(
+        {
+            base_element(label)
+            for label in labels
+            if base_element(label) not in volumes
+        }
+    )
     if missing:
         raise ValueError(
             "No solvent-displaced SAXS volume for "
@@ -679,17 +907,27 @@ def calculate_molecule(
     topology = _resolve_path(molecule.get("topology"), base)
     trajectory = _resolve_path(molecule.get("trajectory"), base)
     mapping_path = _resolve_path(molecule.get("mapping"), base)
+    index_path = _resolve_path(molecule.get("index"), base)
     if topology is None or mapping_path is None:
         raise ValueError(f"{name}: topology and mapping are required")
-    for path in (topology, mapping_path, trajectory):
+    for path in (topology, mapping_path, trajectory, index_path):
         if path is not None and not path.is_file():
             raise FileNotFoundError(path)
-    mapping = read_cgbuilder_mapping(mapping_path)
+    mapping = read_cgbuilder_mapping(mapping_path, index_path)
+    config = _resolve_settings_bead_keys(config, mapping)
     universe = mda.Universe(str(topology), *([str(trajectory)] if trajectory else []))
     trajectory_settings = config["trajectory"]
     selected_indices, occurrences = _selected_occurrences(
         universe, str(trajectory_settings["selection"]), mapping.atom_count
     )
+    if mapping.atom_topology is not None:
+        expected = np.asarray(mapping.atom_topology, dtype=int) - 1
+        if not np.array_equal(np.asarray(occurrences[0]), expected):
+            raise ValueError(
+                f"{name}: the index-defined template requires the first selected "
+                f"occurrence to contain topology atoms {list(mapping.atom_topology)} "
+                "in that order; adjust the trajectory selection"
+            )
     elements = resolve_elements(
         universe, selected_indices, mapping.atom_count, config.get("element_overrides", {})
     )
@@ -850,6 +1088,10 @@ def calculate_molecule(
             "sha256": _file_sha256(trajectory),
         },
         "mapping": {"path": str(mapping_path), "sha256": _file_sha256(mapping_path)},
+        "index": {
+            "path": None if index_path is None else str(index_path),
+            "sha256": _file_sha256(index_path),
+        },
         "atomic_volumes": volume_provenance,
         "packages": {
             package: importlib.metadata.version(package)
@@ -861,6 +1103,7 @@ def calculate_molecule(
     return MoleculeResult(
         name=name,
         bead_order=list(mapping.bead_order),
+        bead_names=list(mapping.bead_names),
         groups=groups,
         frames=frames,
         occurrences=len(occurrences),
@@ -994,11 +1237,11 @@ def plot_fits(
 def _plain(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return [_plain(item) for item in value.tolist()]
-    if isinstance(value, (np.floating, np.integer)):
+    if isinstance(value, np.floating | np.integer):
         return value.item()
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_plain(item) for item in value]
     return value
 
@@ -1009,6 +1252,7 @@ def result_report(result: MoleculeResult, config: Mapping[str, Any]) -> dict[str
         "frames": result.frames,
         "molecule_occurrences": result.occurrences,
         "bead_order": result.bead_order,
+        "bead_names": result.bead_names,
         "identical_bead_groups": result.groups,
         "q": config["q"],
         "fit": config["fit"],
@@ -1026,7 +1270,9 @@ def result_report(result: MoleculeResult, config: Mapping[str, Any]) -> dict[str
     }
 
 
-def write_result(output: Path, result: MoleculeResult, config: Mapping[str, Any], force: bool) -> None:
+def write_result(
+    output: Path, result: MoleculeResult, config: Mapping[str, Any], force: bool
+) -> None:
     prefix = output / result.name
     for method in result.methods:
         write_curves(Path(f"{prefix}_{method}_curves.csv"), result, method, force)
@@ -1109,7 +1355,7 @@ def write_project_outputs(
 def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     configured = config.get("molecules")
     if configured:
-        cli_molecule_values = (args.topology, args.trajectory, args.mapping, args.name)
+        cli_molecule_values = (args.topology, args.trajectory, args.mapping, args.name, args.index)
         if any(value is not None for value in cli_molecule_values):
             raise ValueError("CLI molecule arguments cannot be combined with YAML molecules")
         specs = [dict(item) for item in configured]
@@ -1122,13 +1368,14 @@ def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list
                 "topology": args.topology,
                 "trajectory": args.trajectory,
                 "mapping": args.mapping,
+                "index": args.index,
                 "count": 1,
             }
         ]
     names = [str(spec.get("name") or Path(str(spec["mapping"])).stem) for spec in specs]
     if len(names) != len(set(names)):
         raise ValueError("molecule names must be unique")
-    for spec, name in zip(specs, names):
+    for spec, name in zip(specs, names, strict=True):
         spec["name"] = name
         count = int(spec.get("count", 1))
         if count < 1:
@@ -1140,13 +1387,27 @@ def _molecule_specs(args: argparse.Namespace, config: Mapping[str, Any]) -> list
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", help="bonded atomistic topology")
-    parser.add_argument("--trajectory", help="atomistic trajectory; topology coordinates are used if omitted")
+    parser.add_argument(
+        "--trajectory",
+        help="atomistic trajectory; topology coordinates are used if omitted",
+    )
     parser.add_argument("--mapping", help="CGBuilder mapping")
+    parser.add_argument(
+        "--index",
+        help="index (.ndx) file defining the atom membership of every bead "
+        "occurrence; required when [ martini ] bead names repeat",
+    )
     parser.add_argument("--name", help="output molecule name")
     parser.add_argument("--config", type=Path, help="YAML settings or project file")
     parser.add_argument("--output", type=Path, help="new output directory")
-    parser.add_argument("--force", action="store_true", help="allow replacement of named output files")
-    parser.add_argument("--dry-run", action="store_true", help="validate inputs and report bead groups without writing")
+    parser.add_argument(
+        "--force", action="store_true", help="allow replacement of named output files"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate inputs and report bead groups without writing",
+    )
     return parser
 
 

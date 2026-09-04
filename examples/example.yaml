@@ -49,11 +49,14 @@ saxs:
   solvent_electron_density: 0.334
   # electron_density_overrides: bead- or automatic-group-specific densities.
   # A bead key affects only that bead; group:<representative> affects every
-  # member of the automatically detected group. For example:
+  # member of the automatically detected group. When [martini] bead names
+  # repeat, address a single occurrence positionally as NAME#k (SC1#3 is the
+  # third SC1); a plain repeated name is rejected as ambiguous. For example:
   #
   # electron_density_overrides:
   #   B3: 0.300
   #   group:B8: 0.214
+  #   SC1#3: 0.240
   electron_density_overrides: {}
   # excluded_volume_overrides: solvent-displaced atomic volumes in A^3 for
   # elements absent from the bundled H, D, C, N, O, and S table, or deliberate
@@ -135,6 +138,13 @@ plot:
 #     trajectory: trajectories/molecule_a.xtc
 #     # mapping: CGBuilder mapping with [martini] and [atoms] sections.
 #     mapping: mappings/molecule_a.map
+#     # index: optional CGBuilder index (.ndx) file defining the atom
+#     # membership of every bead occurrence. Required whenever [martini]
+#     # contains repeated bead names (e.g. one amino-acid mapping reused for
+#     # several residues); the index groups must be listed in [martini] order
+#     # and are authoritative for the atom-to-bead assignment. On the command
+#     # line, pass --index instead.
+#     index: mappings/molecule_a.ndx
 #     # count: number of copies in the target CG mixture. Counts greater than
 #     # one generate expanded project_*.inp parameter fragments.
 #     count: 100

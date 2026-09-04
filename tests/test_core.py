@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from argparse import Namespace
 import copy
+from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
@@ -138,6 +138,18 @@ def test_xray_factor_requires_a_displaced_volume():
         )
 
 
+def test_xray_missing_volume_reports_the_base_element():
+    with pytest.raises(ValueError, match="H; provide") as excinfo:
+        ff.xray_factors(
+            ["2H"],
+            np.ones(1),
+            np.array([0.0, 0.1]),
+            density=0.334,
+            volumes={"C": 16.44},
+        )
+    assert "2H" not in str(excinfo.value)
+
+
 def test_isotope_override_cannot_change_the_element():
     with pytest.raises(ValueError, match="changes atom 1 element"):
         core.isotope_labels(["C"], {1: "N-15"})
@@ -219,9 +231,9 @@ def test_documented_example_config_loads():
     assert config == ff.DEFAULT_CONFIG
 
 
-@pytest.mark.parametrize("option", ["topology", "trajectory", "mapping", "name"])
+@pytest.mark.parametrize("option", ["topology", "trajectory", "mapping", "name", "index"])
 def test_project_mode_rejects_cli_molecule_arguments(option):
-    values = {"topology": None, "trajectory": None, "mapping": None, "name": None}
+    values = {"topology": None, "trajectory": None, "mapping": None, "name": None, "index": None}
     values[option] = "command-line-value"
     args = Namespace(**values)
     config = {"molecules": [{"name": "from-yaml", "mapping": "molecule.map"}]}
@@ -244,6 +256,208 @@ def test_output_directory_is_non_clobbering(tmp_path):
     with pytest.raises(FileExistsError):
         _prepare_output(output, force=False)
     assert existing.read_text() == "keep"
+
+
+def write_duplicate_name_mapping(path: Path) -> Path:
+    path.write_text(
+        """[ to ]
+martini
+
+[ martini ]
+B0 B0
+
+[ atoms ]
+1 C1 B0
+2 H1 B0
+3 O1 B0
+4 C2 B0
+5 H2 B0
+6 O2 B0
+"""
+    )
+    return path
+
+
+def write_duplicate_name_index(path: Path) -> Path:
+    path.write_text("[ B0 ]\n1 2 3\n\n[ B0 ]\n4 5 6\n")
+    return path
+
+
+def _pdb_atom(serial: int, name: str, x: float, y: float, z: float, element: str) -> str:
+    return (
+        f"ATOM{serial:7d}  {name:<3s} MOL A   1    {x:8.3f}{y:8.3f}{z:8.3f}"
+        f"  1.00  0.00           {element}  "
+    )
+
+
+def _molecule_block(index: int) -> list[tuple[str, float, float, float, str]]:
+    return [
+        (f"C{index}", 10.0 * index, 0.000, 0.000, "C"),
+        (f"H{index}", 10.0 * index + 1.090, 0.000, 0.000, "H"),
+        (f"O{index}", 10.0 * index - 1.230, 0.000, 0.000, "O"),
+    ]
+
+
+def write_molecule_chain_pdb(path: Path, molecules: int) -> Path:
+    atoms = sum((_molecule_block(i + 1) for i in range(molecules)), [])
+    lines = [_pdb_atom(serial + 1, *atom) for serial, atom in enumerate(atoms)]
+    lines += [
+        f"CONECT{a:5d}{b:5d}"
+        for n in range(molecules)
+        for a, b in [(3 * n + 1, 3 * n + 2), (3 * n + 1, 3 * n + 3)]
+    ]
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def write_two_molecule_pdb(path: Path) -> Path:
+    return write_molecule_chain_pdb(path, 2)
+
+
+def test_duplicate_bead_names_require_an_index(tmp_path):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    with pytest.raises(ValueError, match="index file is supplied"):
+        ff.read_cgbuilder_mapping(mapping)
+
+
+def test_index_defines_positional_bead_assignments(tmp_path):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = write_duplicate_name_index(tmp_path / "dup.ndx")
+    parsed = ff.read_cgbuilder_mapping(mapping, index)
+    assert parsed.bead_names == ("B0", "B0")
+    assert parsed.bead_order == ("B0#1", "B0#2")
+    assert parsed.bead_atoms == {"B0#1": (1, 2, 3), "B0#2": (4, 5, 6)}
+    assert parsed.atom_count == 6
+    assert parsed.indexed
+    assert parsed.atom_topology == (1, 2, 3, 4, 5, 6)
+
+
+def test_index_group_names_must_follow_martini_order(tmp_path):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = tmp_path / "bad.ndx"
+    index.write_text("[ B0 ]\n1 2 3\n\n[ B1 ]\n4 5 6\n")
+    with pytest.raises(ValueError, match="do not match"):
+        ff.read_cgbuilder_mapping(mapping, index)
+
+
+def test_index_memberships_must_agree_with_the_mapping(tmp_path):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = tmp_path / "short.ndx"
+    index.write_text("[ B0 ]\n1 2 3\n\n[ B0 ]\n4 5\n")
+    with pytest.raises(ValueError, match="disagree"):
+        ff.read_cgbuilder_mapping(mapping, index)
+
+
+@pytest.mark.parametrize(
+    "content, message",
+    [
+        ("[ B0 ]\n1 2 3\n\n[ B0 ]\n0 5 6\n", "invalid atom index 0"),
+        ("[ B0 ]\n1 2 3\n\n[ B0 ]\n4 5 5\n", "repeated atom index 5"),
+    ],
+)
+def test_index_rejects_invalid_or_repeated_atoms(tmp_path, content, message):
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = tmp_path / "bad.ndx"
+    index.write_text(content)
+    with pytest.raises(ValueError, match=message):
+        ff.read_cgbuilder_mapping(mapping, index)
+
+
+def test_mapping_rejects_repeated_atom_rows(tmp_path):
+    # 'B0 B0' memberships are valid: an atom may be shared between two
+    # beads that share a name. The raised error must come from the
+    # repeated atom index (first column), not the memberships.
+    text = """[ to ]
+martini
+
+[ martini ]
+B0 B0
+
+[ atoms ]
+1 C1 B0 B0
+1 H1 B0
+2 O1 B0
+"""
+    with pytest.raises(ValueError, match="duplicate atom index 1"):
+        ff.read_cgbuilder_mapping(write_mapping(tmp_path / "dup.map", text))
+
+
+def test_index_template_must_match_the_first_occurrence(tmp_path):
+    topology = write_molecule_chain_pdb(tmp_path / "four.pdb", 4)
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    # The index template covers atoms 7-12, so the first selected 6-atom
+    # occurrence (atoms 1-6) cannot be the template.
+    index = tmp_path / "late.ndx"
+    index.write_text("[ B0 ]\n7 8 9\n\n[ B0 ]\n10 11 12\n")
+    with pytest.raises(ValueError, match="template requires"):
+        ff.calculate_molecule(
+            {
+                "name": "swapped",
+                "topology": topology,
+                "trajectory": None,
+                "mapping": mapping,
+                "index": index,
+            },
+            copy.deepcopy(ff.DEFAULT_CONFIG),
+            tmp_path,
+        )
+
+
+def test_duplicate_name_molecule_calculates_and_writes_fragments(tmp_path):
+    topology = write_two_molecule_pdb(tmp_path / "dup.pdb")
+    mapping = write_duplicate_name_mapping(tmp_path / "dup.map")
+    index = write_duplicate_name_index(tmp_path / "dup.ndx")
+    config = copy.deepcopy(ff.DEFAULT_CONFIG)
+    config["q"] = {"minimum": 0.0, "maximum": 0.2, "step": 0.02}
+    config["fit"]["degree"] = 3
+    result = ff.calculate_molecule(
+        {
+            "name": "dup",
+            "topology": topology,
+            "trajectory": None,
+            "mapping": mapping,
+            "index": index,
+        },
+        config,
+        tmp_path,
+    )
+    assert result.bead_names == ["B0", "B0"]
+    assert list(result.groups) == ["B0#1"]
+    assert result.groups["B0#1"] == ["B0#1", "B0#2"]
+
+    output = tmp_path / "results"
+    _prepare_output(output, force=False)
+    ff.write_result(output, result, config, force=False)
+    fragment = (output / "dup_saxs_parameters.inp").read_text()
+    parameter_lines = [line for line in fragment.splitlines() if "PARAMETERS" in line]
+    assert len(parameter_lines) == len(result.bead_order) == 2
+    lengths = (output / "dup_sans_scattering_lengths.inp").read_text()
+    assert len([line for line in lengths.splitlines() if "SCATLEN" in line]) == 2
+    report = (output / "dup_report.yaml").read_text()
+    assert "bead_names" in report
+
+
+def test_positional_override_keys_resolve_and_ambiguity_is_rejected(tmp_path):
+    mapping = ff.read_cgbuilder_mapping(
+        write_duplicate_name_mapping(tmp_path / "dup.map"),
+        write_duplicate_name_index(tmp_path / "dup.ndx"),
+    )
+    config = core._resolve_settings_bead_keys(
+        {
+            "saxs": {"electron_density_overrides": {"B0#2": 0.214}},
+            "identity": {"force_split": ["B0#1"], "force_groups": {}},
+            "sign": {"crossovers": {}, "widths": {}},
+        },
+        mapping,
+    )
+    assert config["saxs"]["electron_density_overrides"] == {"B0#2": 0.214}
+    assert config["identity"]["force_split"] == ["B0#1"]
+    with pytest.raises(ValueError, match="ambiguous bead name"):
+        core._resolve_settings_bead_keys(
+            {"saxs": {"electron_density_overrides": {"B0": 0.214}}, "identity": {}, "sign": {}},
+            mapping,
+        )
 
 
 def test_minimal_end_to_end_calculation_and_outputs(tmp_path):
