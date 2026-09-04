@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Allow repeated bead names in CGBuilder `[ martini ]` mappings so one
+  amino-acid mapping can cover every residue. Each occurrence becomes a
+  distinct positional bead (`NAME#k`); a CGBuilder index (`.ndx`) file must
+  be supplied via the new `--index` option (or a molecule `index:` entry)
+  and is authoritative for the atom-to-bead assignment.
+- Group CSV/report/plot keys, `force_split`/`force_groups`, sign
+  crossovers/widths, and SAXS density overrides resolve positional bead
+  keys; plain names remain valid when unique.
+- Reports record the original `bead_names` order alongside the unique
+  `bead_order`, and provenance captures the index file.
+- PLUMED fragments keep exactly one `PARAMETERSn`/`SCATLENn` line per
+  `[ martini ]` bead, in mapping order.
+
 ## 0.1.0 — 2026-08-20
 
 - Package the atomistic-to-bead SAXS/SANS workflow as a Python library and CLI.
